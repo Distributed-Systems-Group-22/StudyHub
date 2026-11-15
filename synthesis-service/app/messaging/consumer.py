@@ -77,31 +77,99 @@ def on_message(channel, method, properties, body):
 def on_document_event(channel, method, properties, body):
     try:
         event = json.loads(body)
-        event_type = event.get("eventType") or event.get("event_type")
 
-        if event_type == "document.deleted":
-            doc_id = str(event.get("documentId") or event.get("document_id", ""))
-            if doc_id:
-                from app.database import get_connection
-                with get_connection() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute("""
-                            UPDATE synthesis_results
-                            SET status = 'INVALIDATED'
-                            WHERE summary_id IN (
-                                SELECT summary_id FROM summary_sources WHERE document_id = %s
-                            )
-                        """, (doc_id,))
-                print(
-                    f"[Consumer] Document {doc_id} deleted -> Invalidated associated synthesis summaries.",
-                    flush=True
-                )
+        if not isinstance(event, dict):
+            raise ValueError("Event must be a JSON object")
 
-        channel.basic_ack(delivery_tag=method.delivery_tag)
+        event_type = (
+            event.get("eventType")
+            or event.get("event_type")
+        )
+
+        if event_type != "document.deleted":
+            print(
+                f"[Consumer] Ignoring event: {event_type}",
+                flush=True
+            )
+            channel.basic_ack(
+                delivery_tag=method.delivery_tag
+            )
+            return
+
+        raw_doc_id = (
+            event.get("documentId")
+            or event.get("document_id")
+        )
+
+        # Validate the document UUID before accessing the DB.
+        doc_id = str(UUID(str(raw_doc_id)))
+
+    except (ValueError, TypeError, KeyError) as error:
+        print(
+            f"[Consumer] Invalid document event: {error}",
+            flush=True
+        )
+        channel.basic_nack(
+            delivery_tag=method.delivery_tag,
+            requeue=False
+        )
+        return
+
+    try:
+        from app.database import get_connection
+
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE synthesis_results
+                    SET status = 'INVALIDATED'
+                    WHERE status = 'VALID'
+                      AND summary_id IN (
+                          SELECT summary_id
+                          FROM summary_sources
+                          WHERE document_id = %s
+                      )
+                """, (doc_id,))
+
+                affected = cur.rowcount
+
+        print(
+            f"[Consumer] document.deleted: {doc_id}; "
+            f"invalidated {affected} summaries",
+            flush=True
+        )
+
+        # ACK only after the DB transaction commits.
+        channel.basic_ack(
+            delivery_tag=method.delivery_tag
+        )
+
+    except psycopg.Error as error:
+        print(
+            f"[Consumer] Database error while invalidating "
+            f"{doc_id}: {error}",
+            flush=True
+        )
+
+        # Temporary DB failure: retry the message.
+        time.sleep(2)
+
+        channel.basic_nack(
+            delivery_tag=method.delivery_tag,
+            requeue=True
+        )
 
     except Exception as error:
-        print(f"[Consumer] Error handling document event: {error}", flush=True)
-        channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+        print(
+            f"[Consumer] Unexpected deletion event error: "
+            f"{error}",
+            flush=True
+        )
+
+        # Do not acknowledge a message that was not processed.
+        # Closing the channel lets RabbitMQ redeliver
+        # the unacknowledged message after reconnection.
+        raise
 
 
 def main():
@@ -120,6 +188,25 @@ def main():
                 queue=DOCUMENT_EVENTS_QUEUE,
                 durable=True
             )
+            
+            # Content Service publishes deletion events.
+            channel.exchange_declare(
+                exchange="document.events",
+                exchange_type="topic",
+                durable=True
+            )
+
+            channel.queue_bind(
+                exchange="document.events",
+                queue=DOCUMENT_EVENTS_QUEUE,
+                routing_key="document.deleted"
+            )
+
+            print(
+                "Document deletion events binding configured",
+                flush=True
+            )
+
 
             channel.basic_qos(prefetch_count=1)
 

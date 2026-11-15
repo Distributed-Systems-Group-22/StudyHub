@@ -1,45 +1,97 @@
+
 import os
+
 import httpx
 
 
-CONTENT_SERVICE_URL = os.getenv("CONTENT_SERVICE_URL", "http://content-api:8000")
-SYNTHESIS_TOKEN = os.getenv("STUDYHUB_SYNTHESIS_TOKEN", "")
+CONTENT_SERVICE_URL = os.getenv(
+    "CONTENT_SERVICE_URL",
+    "http://content-api:8000"
+)
+
+SYNTHESIS_TOKEN = os.getenv(
+    "STUDYHUB_SYNTHESIS_TOKEN",
+    ""
+)
 
 
-def verify_document_access(user_id: str, document_ids: list[str]) -> list[dict]:
+class ContentServiceUnavailable(Exception):
+    """Content Service cannot verify document access."""
+
+
+def verify_document_access(
+    user_id: str,
+    document_ids: list[str]
+) -> list[dict]:
     """
-    Performs live permission and version checks against the Content Service.
-    Implements a Fail-Closed policy: returns an empty list if Content Service
-    is unreachable or returns an error.
+    Verify document permissions and versions with Content Service.
+
+    Fail-closed policy:
+    - Missing configuration -> raise error
+    - Service unavailable -> raise error
+    - Unauthorized documents -> not included in response
     """
+
     if not document_ids:
         return []
 
-    # If running in local standalone test without Content Service configured
-    if not SYNTHESIS_TOKEN or not CONTENT_SERVICE_URL:
-        print("[ContentClient] STUDYHUB_SYNTHESIS_TOKEN not set; skipping live check.", flush=True)
-        return [{"documentId": doc_id, "documentVersion": 1} for doc_id in document_ids]
+    # Never bypass permission checks.
+    if not SYNTHESIS_TOKEN:
+        raise ContentServiceUnavailable(
+            "STUDYHUB_SYNTHESIS_TOKEN is not configured"
+        )
 
-    url = f"{CONTENT_SERVICE_URL.rstrip('/')}/internal/documents/access-check"
+    if not CONTENT_SERVICE_URL:
+        raise ContentServiceUnavailable(
+            "CONTENT_SERVICE_URL is not configured"
+        )
+
+    url = (
+        f"{CONTENT_SERVICE_URL.rstrip('/')}"
+        "/internal/documents/access-check"
+    )
+
     headers = {
         "Authorization": f"Bearer {SYNTHESIS_TOKEN}",
         "User_Name": user_id,
         "Content-Type": "application/json",
     }
-    payload = {"documentIds": document_ids}
+
+    payload = {
+        "documentIds": document_ids
+    }
 
     try:
         with httpx.Client(timeout=4.0) as client:
-            response = client.post(url, json=payload, headers=headers)
-            if response.status_code == 200:
-                data = response.json()
-                return data.get("documents", [])
-            else:
-                print(
-                    f"[ContentClient] Access check failed with status {response.status_code}: {response.text}",
-                    flush=True
-                )
-                return []
-    except Exception as exc:
-        print(f"[ContentClient] Access check connection error: {exc}", flush=True)
-        return []
+            response = client.post(
+                url,
+                json=payload,
+                headers=headers
+            )
+
+    except httpx.RequestError as error:
+        raise ContentServiceUnavailable(
+            "Content Service is unreachable"
+        ) from error
+
+    if response.status_code != 200:
+        raise ContentServiceUnavailable(
+            f"Content Service verification failed: "
+            f"HTTP {response.status_code}"
+        )
+
+    try:
+        data = response.json()
+    except ValueError as error:
+        raise ContentServiceUnavailable(
+            "Content Service returned invalid JSON"
+        ) from error
+
+    documents = data.get("documents")
+
+    if not isinstance(documents, list):
+        raise ContentServiceUnavailable(
+            "Content Service returned invalid document data"
+        )
+
+    return documents

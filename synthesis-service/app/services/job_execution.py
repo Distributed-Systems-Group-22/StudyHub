@@ -312,6 +312,47 @@ def fail_job(job, error):
     )
 
 
+
+def verify_source_snapshot(user_id, document_ids):
+    """Verify access to every document and capture its version."""
+
+    verified_docs = verify_document_access(
+        user_id=user_id,
+        document_ids=document_ids
+    )
+
+    requested = {str(doc_id) for doc_id in document_ids}
+
+    verified = {}
+
+    for doc in verified_docs:
+        doc_id = str(doc["documentId"])
+        version = doc["documentVersion"]
+
+        if doc_id not in requested:
+            raise ValueError("Unexpected document in access response")
+
+        if (
+            not isinstance(version, int)
+            or isinstance(version, bool)
+            or version < 1
+        ):
+            raise ValueError("Invalid document version")
+
+        if doc_id in verified:
+            raise ValueError("Duplicate document in access response")
+
+        verified[doc_id] = version
+
+    if set(verified) != requested:
+        raise PermissionError(
+            "One or more documents are unavailable or unauthorized"
+        )
+
+    return verified
+
+
+
 def process_job(job_id):
     job = claim_job(job_id)
 
@@ -325,33 +366,51 @@ def process_job(job_id):
             flush=True
         )
 
-        # Step 1: Live permission check with Content Service (ADR Live Permission Checks)
-        user_id = job.get("user_id", "dev-user-001")
+        user_id = job["user_id"]
         doc_ids = job["document_ids"]
-        verified_docs = verify_document_access(user_id=user_id, document_ids=doc_ids)
-        verified_ids = {str(d.get("documentId")) for d in verified_docs}
 
-        # If Content Service token is configured and verification fails, fail closed
-        if os.getenv("STUDYHUB_SYNTHESIS_TOKEN") and not all(str(did) in verified_ids for did in doc_ids):
-            raise PermissionError(
-                f"Access check failed: one or more documents are missing or unauthorized for user {user_id}"
-            )
-
-        # Step 2: Get synthetic source documents (or Search Service API in later phase)
-        documents = get_documents(
-            job["document_ids"]
+        # Step 1: Verify permissions and document versions.
+        initial_versions = verify_source_snapshot(
+            user_id=user_id,
+            document_ids=doc_ids
         )
 
-        # Step 3: Call real Ollama AI.
+        print(
+            f"Initial document versions: {initial_versions}",
+            flush=True
+        )
+
+        # Step 2: Retrieve source content.
+        # Real Search Service integration is still pending.
+        documents = get_documents(doc_ids)
+
+        # Step 3: Generate summary with Ollama.
         result = generate_summary(
             documents=documents,
             instruction=job["instruction"]
         )
 
-        # Step 4: Save result with model metadata and source citations.
-        sources = verified_docs if verified_docs else [
-            {"documentId": did, "documentVersion": 1} for did in doc_ids
+        # Step 4: Verify permissions and versions again.
+        current_versions = verify_source_snapshot(
+            user_id=user_id,
+            document_ids=doc_ids
+        )
+
+        if current_versions != initial_versions:
+            raise RuntimeError(
+                "Document permissions or versions changed "
+                "during summary generation"
+            )
+
+        # Step 5: Save verified source metadata.
+        sources = [
+            {
+                "documentId": doc_id,
+                "documentVersion": version
+            }
+            for doc_id, version in initial_versions.items()
         ]
+
         completed = complete_job(
             job=job,
             summary_text=result["summary_text"],
@@ -367,8 +426,8 @@ def process_job(job_id):
             )
         else:
             print(
-                f"AI result discarded: lease or claim expired "
-                f"for job {job_id}",
+                f"AI result discarded for job {job_id}: "
+                "lease or claim expired",
                 flush=True
             )
 
