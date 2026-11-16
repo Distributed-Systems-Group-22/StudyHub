@@ -1,158 +1,211 @@
 # AI Processing Service
 
-StudyHub 的异步文档处理 worker，无 HTTP API。消费 Content 的 `document.uploaded`，
-下载指定版本文件，提取/转写文本，生成单文档摘要（含关键事实）及原文分块向量，
-回报 Content，并发布结果供 Search 使用。
+StudyHub's asynchronous document processing worker consumes `document.uploaded`
+events, downloads a specific document version from Content, extracts or transcribes
+text, and generates a single-document summary with key facts and chunk embeddings.
+It reports the terminal processing status to Content and publishes derived results
+for Search. The worker has no HTTP API; the native transcription bridge has its own API.
 
-## 本地运行
+## Service boundaries
 
-从仓库根目录创建 `.env`（可使用已有 setup 脚本），启动现有 Content Compose 栈。
-填写根 `.env` 的 AI 配置后：
+- Content owns original files, document metadata, versions, access and visible status.
+- AI Processing owns extraction, transcription, summaries, embeddings and job recovery.
+- Search owns vector storage, indexing, retrieval and live permission checks.
+- Synthesis owns cross-document summaries. Its model settings remain independent.
+
+Search integration is still pending. The proposed result event below is not a claim
+that the full four-service workflow is implemented. Synthesis currently supports
+explicit mock fixtures; its real Search document-provider contract is not connected.
+
+## Configuration
+
+Use the repository's setup script to initialize the root `.env` and service tokens.
+For an existing `.env`, copy missing AI Processing settings from `.env.example`.
+Do not overwrite existing credentials or replace Synthesis settings with Processing settings.
+
+| Setting | Purpose |
+| --- | --- |
+| `STUDYHUB_DATABASE_URL` | Host PostgreSQL URL; default development port is 5433 |
+| `STUDYHUB_AMQP_URL` | Host RabbitMQ URL; must match `RABBITMQ_HOST_PORT` |
+| `STUDYHUB_PROCESSING_TOKEN` | Same Processing bearer token configured in Content |
+| `AI_CONTENT_URL` | Host Content URL, normally `http://127.0.0.1:8000` |
+| `AI_MODEL_PROVIDER` | `ollama` for native endpoints, or `openai` for compatible API formats |
+| `AI_SUMMARY_URL`, `AI_SUMMARY_MODEL`, `AI_SUMMARY_KEY` | Summary endpoint, model and optional key |
+| `AI_EMBEDDING_URL`, `AI_EMBEDDING_MODEL`, `AI_EMBEDDING_KEY` | Embedding endpoint, model and optional key |
+| `AI_TRANSCRIPTION_URL`, `AI_TRANSCRIPTION_MODEL`, `AI_TRANSCRIPTION_KEY` | Multipart transcription endpoint, allowed model and optional key |
+| `AI_HTTP_TIMEOUT` | HTTP operation timeout in seconds; default 300 |
+| `AI_CHUNK_SIZE`, `AI_CHUNK_OVERLAP` | Character counts, not token counts; defaults 2000 and 200 |
+| `AI_MAX_ATTEMPTS` | Processing attempts per document version; default 3 |
+| `AI_OLLAMA_CONTEXT` | Local summary context size; default 4096 tokens |
+| `AI_SUMMARY_MAX_TOKENS` | Summary output limit; default 512 tokens |
+
+The default models are `qwen3:4b`, `bge-m3` and
+`mlx-community/whisper-small-mlx`. Summary and embedding tasks share the provider
+setting. Transcription always sends multipart form data and expects a `text` field.
+For compatible third-party APIs, change the provider, full endpoint URLs, models and
+keys together. Synthesis uses its separate `AI_MODEL` and `OLLAMA_BASE_URL` settings.
+
+## Run on the host
+
+Reuse your existing Conda environment if the dependencies are already installed:
 
 ```bash
+conda activate comp41720-groupAS
 cd ai-processing-service
-python3 -m venv .venv
-source .venv/bin/activate
 pip install -r requirements.txt
 python main.py --check-config
 python main.py
 ```
 
-根 `.env.example` 已配置本机 Ollama（Qwen3 4B + BGE-M3）和原生 MLX 转写地址。
-已有 `.env` 不会被自动修改，请将 AI 配置同步到根 `.env`。缺少必要配置时在消费消息前退出。
-`--check-config` 只检查配置，不请求外部服务。
+Alternatively, create a Python virtual environment and install the same requirements.
+`--check-config` validates settings without connecting to external services.
+The worker exits before consuming messages when required settings are missing.
+Start Content, PostgreSQL, RabbitMQ and the required model services before the worker.
 
-| 配置 | 用途 |
+## Run the worker with Docker Compose
+
+The root Compose file includes `ai-processing-worker` behind the optional
+`processing` profile. Its image contains the Python worker and migrations;
+Ollama and MLX Whisper run natively on the Mac.
+
+From the repository root, start the native model services, then run:
+
+```bash
+docker compose --profile processing up --build -d ai-processing-worker
+docker compose logs -f ai-processing-worker
+```
+
+Compose starts the worker's Content, database and broker dependencies. To start
+all services, including Synthesis, use `docker compose --profile processing up --build -d`.
+Default `docker compose up` leaves the optional Processing worker disabled.
+Do not run a host worker and a container worker unintentionally at the same time.
+
+Compose injects environment variables explicitly and supplies container addresses:
+
+| Destination | Container address |
 | --- | --- |
-| `AI_SUMMARY_URL` / `AI_SUMMARY_MODEL` / `AI_SUMMARY_KEY` | 摘要和关键事实，默认原生 Ollama `/api/chat` endpoint |
-| `AI_EMBEDDING_URL` / `AI_EMBEDDING_MODEL` / `AI_EMBEDDING_KEY` | 默认原生 Ollama `/api/embed` endpoint |
-| `AI_TRANSCRIPTION_URL` / `AI_TRANSCRIPTION_MODEL` / `AI_TRANSCRIPTION_KEY` | Mac 原生转写服务 endpoint；处理音频时才要求配置 |
-| `AI_CONTENT_URL` | 本机默认 `http://127.0.0.1:8000`；容器内使用 `http://content-api:8000` |
-| `STUDYHUB_PROCESSING_TOKEN` | 与 Content 配置一致的 token |
-| `STUDYHUB_DATABASE_URL` / `STUDYHUB_AMQP_URL` | PostgreSQL / RabbitMQ 连接串 |
-| `AI_HTTP_TIMEOUT` | HTTP 每次网络操作超时秒数，默认 300 |
-| `AI_CHUNK_SIZE` / `AI_CHUNK_OVERLAP` | 字符数，默认 2000 / 200；不是 token 数 |
-| `AI_MAX_ATTEMPTS` | 每个文档版本的处理尝试次数，默认 3 |
+| PostgreSQL | `db:5432` |
+| RabbitMQ | `rabbitmq:5672` |
+| Content | `http://content-api:8000` |
+| Summary | `http://host.docker.internal:11434/api/chat` |
+| Embeddings | `http://host.docker.internal:11434/api/embed` |
+| Transcription | `http://host.docker.internal:8001/v1/audio/transcriptions` |
 
-默认 `AI_MODEL_PROVIDER=ollama` 使用原生接口，关闭 thinking / streaming，
-设置 4096 token 上下文和最多 512 个输出 token；embedding 禁止静默截断。
-每个文档的摘要、向量阶段在 finally 中分别请求卸载模型，避免长期同时驻留。
-`AI_OLLAMA_CONTEXT` 和 `AI_SUMMARY_MAX_TOKENS` 可调整上下文及输出上限。
-长摘要按保守字符预算递归归并；字符预算不是精确 tokenizer 计数，仍需用实际材料验证。
-输出达到 token 上限会明确失败，不把截断的摘要作为完整结果。
+Override model URLs for the container using `AI_DOCKER_SUMMARY_URL`,
+`AI_DOCKER_EMBEDDING_URL` and `AI_DOCKER_TRANSCRIPTION_URL`. Host URLs remain
+separate, so switching between host and container execution does not require editing them.
+`host.docker.internal` assumes Docker Desktop on macOS; other hosts may need networking changes.
 
-切换第三方兼容接口时设置 `AI_MODEL_PROVIDER=openai` 并更换完整 URL / 模型 / KEY。
-两项文字任务当前共用 provider 设置。转写固定使用 multipart 请求并读取 `text`。
-KEY 可为空以支持本地模型。
-摘要及关键事实当前合并为一个文本字段，未实现独立结构化 JSON 字段。
+If a local RabbitMQ already occupies port 5672, set `RABBITMQ_HOST_PORT=5673` and
+`RABBITMQ_MANAGEMENT_PORT=15673` in `.env`. Ensure the host AMQP URL uses that port.
+Container-to-container connections continue to use `rabbitmq:5672`.
 
-支持 UTF-8 TXT/MD/CSV、文字型 PDF、DOCX，以及 MP3/WAV/M4A/MP4/OGG/WEBM/FLAC
-转写。PDF 不执行 OCR；旧版 DOC 不支持。原文件最大 5 MiB，提取文本最多
-200000 字符。长文档逐块摘要再递归合并；原文块用于 embedding，结果含字符偏移。
+## Native Mac model services
 
-## 持久化与重试
+Open Ollama with `qwen3:4b` and `bge-m3` downloaded. Native Ollama APIs disable
+thinking and streaming for summaries, reject output-limit truncation, and disable
+silent embedding input truncation. Each processing phase requests model unloading
+in a `finally` block. A failed unload falls back to Ollama's keep-alive expiry.
+Long summaries are recursively reduced within a conservative character budget;
+this is not an exact tokenizer-based context check.
 
-启动时创建服务自有的 `ai_processing.jobs` 表，不读写 Content 业务表。
-本地开发默认复用现有 PostgreSQL 实例和数据库，使用独立 schema；生产应使用
-独立数据库/角色。当前迁移只有幂等的初始化 SQL，后续 schema 变更需增加迁移机制。
+Run the transcription bridge in a native Apple Silicon Python environment:
 
-按 `(documentId, documentVersion)` 去重，PostgreSQL session advisory lock 阻止
-同版本并发处理。处理成功后先保存结果，再回调 Content、发布消息，最终 ACK。
-回调或发布失败保留暂存结果，重投时无需再次调用模型。发布使用 publisher confirms
-和持久化消息；发布成功但更新任务记录前崩溃仍可能重复发布，结果 eventId 保持不变，
-Search 必须幂等消费。
+```bash
+# From ai-processing-service/, reuse an existing compatible environment.
+pip install -r native/requirements.txt
+# Install ffmpeg with Homebrew if it is not already available.
+python native/transcription_server.py
+```
 
-处理失败最多尝试配置次数，再报告 `failed`；回调/发布等交付错误每隔至少 3 秒重试，
-不计入模型处理次数。回调 409 不覆盖已有状态，会持续重试并需要人工排查。
-Content 返回 404 时跳过并清除暂存结果。格式错误事件进入 `processing.invalid-events`。
-消费线程等待模型时仍维持 RabbitMQ heartbeat。强制停止时未 ACK 的消息可重投。
+The bridge defaults to `127.0.0.1:8001`. `GET /health` checks HTTP liveness without
+loading the model. `POST /v1/audio/transcriptions` accepts `file` and `model` fields.
+Only the configured model is allowed. Each transcription runs in a child process,
+which releases model memory on exit. Requests are serialized; a busy bridge returns
+429. Audio is limited to 5 MiB and temporary files are removed after processing.
+The model is downloaded on first use if it is not cached.
 
-模型步骤尚无逐块检查点，处理阶段中途失败/进程崩溃可能再次产生模型调用费用；
-跨外部模型调用无法保证 exactly-once。已完成任务会清除暂存输出，成功消息由 Search
-保存。未实现重处理 API、删除事件监听、监控或 OCR。
+For Docker access, if loopback binding is unreachable, set
+`AI_TRANSCRIPTION_BIND=0.0.0.0` and a nonempty `AI_TRANSCRIPTION_KEY` in the root `.env`.
+Restart the bridge and recreate the worker so both use the same key. The bridge
+refuses non-loopback binding without a key. Restrict access to the host as appropriate.
+Ollama may also need its host listener configured for Docker access.
 
-## Search 对接：待小组确认的协议
+## Supported inputs and processing limits
 
-新增 durable topic exchange `processing.events`，routing key `document.processed`，
-绑定 durable queue `search.processing-results`。这是本服务提出的契约，现有 Search
-实现尚未对接，不代表四服务已联调完成。Content 的现有队列/事件格式不变。
+Supported documents are UTF-8 TXT, MD and CSV, text-based PDF, and DOCX, including
+DOCX table text. Supported audio extensions are MP3, WAV, M4A, MP4, OGG, WEBM and FLAC.
+Scanned PDFs require OCR, which is not implemented. Legacy DOC is unsupported.
+Original files are limited to 5 MiB and extracted text to 200000 characters.
+Summaries and key facts currently share one text field. Embeddings are generated
+from original text chunks, with character offsets retained in each chunk.
+
+## Persistence and recovery
+
+The worker creates its own `ai_processing.jobs` table at startup. Development reuses
+the Content PostgreSQL instance and database through a separate schema; the worker
+does not access Content business tables. Separate database credentials and ownership
+should be configured for an independently deployed service. The current migration
+is idempotent initialization SQL; future schema changes need a migration mechanism.
+
+Jobs are deduplicated by `(documentId, documentVersion)`. PostgreSQL session advisory
+locks prevent concurrent processing of the same version. Results are persisted
+before the Content callback and confirmed RabbitMQ publication, then the upload
+message is acknowledged. Callback or publication failures retain staged results,
+so redelivery does not repeat successful model work.
+
+A crash after publication but before saving completion can publish the result again.
+The result `eventId` remains stable and Search must consume it idempotently.
+Processing failures consume the configured attempt budget and eventually report
+`failed`. Callback and publication failures retry after at least three seconds,
+without consuming additional model-processing attempts. Callback 409 responses are
+retried for operator investigation rather than overwriting a terminal status.
+Content 404 responses skip the job and clear staged results. Invalid upload events
+are moved to `processing.invalid-events`. Broker heartbeats continue during model calls.
+
+There are no per-chunk checkpoints: a crash during processing may repeat model calls.
+Completed jobs clear staged output; Search is expected to retain delivered results.
+Reprocessing APIs, deletion-event consumption, monitoring and OCR are not implemented.
+
+## Proposed Search result contract
+
+Results use durable topic exchange `processing.events`, routing key
+`document.processed` and durable queue `search.processing-results`.
+The team must agree this contract before integrating Search.
 
 ```json
 {
   "schemaVersion": 1,
-  "eventId": "稳定的结果事件 UUID",
+  "eventId": "1fc17bd4-9a02-4d10-a168-562bd3fd1b24",
   "eventType": "document.processed",
-  "documentId": "文档 UUID",
+  "documentId": "04a1dc78-a5d7-428a-8773-3ba9ec503c22",
   "documentVersion": 1,
-  "summary": "摘要与关键事实",
-  "embeddingModel": "配置的模型名",
-  "summaryModel": "配置的模型名",
+  "summary": "Summary and key facts",
+  "embeddingModel": "bge-m3",
+  "summaryModel": "qwen3:4b",
   "chunks": [
     {"chunkIndex": 0, "startOffset": 0, "endOffset": 4,
-     "text": "原文内容", "embedding": [0.1, 0.2]}
+     "text": "Text", "embedding": [0.1, 0.2]}
   ]
 }
 ```
 
-Search 负责写入向量数据库，处理版本和删除事件的乱序，并在返回搜索结果前执行
-Content 的实时权限检查。Content 的 `succeeded` 在这里表示 AI 结果已持久暂存，
-不代表 Search 已建好索引。最终回调后仍可能发生删除，Search 必须防止迟到结果
-重新激活被删除文档。大量向量直接放消息适合初期联调，后续可改为结果引用。
+The vector is shortened for illustration; BGE-M3 currently returns 1024 dimensions.
+Search owns vector storage, stale-version handling and deletion ordering, and must
+check live Content permissions before returning results. Content `succeeded` means
+AI output has been durably staged, not that Search indexing is complete. Search must
+prevent late processing results from reactivating deleted documents. Large payloads
+may later be replaced with references to stored processing artifacts.
 
-## Docker 与验证
+## Verification
 
-已提供 Dockerfile，但未修改根 Compose。若加入 Compose，需要提供上述环境变量、
-数据库权限，并使用容器内地址 `db:5432`、`rabbitmq:5672` 和 `content-api:8000`。
+From `ai-processing-service/`:
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-测试使用假的 Content/模型及内存任务记录，覆盖重投、交付恢复、失败上限、
-删除、文本分块及 pipeline；不代表真实 PostgreSQL/RabbitMQ/模型端到端验证通过。
-
-
-## Mac 原生模型接入
-
-Ollama 原生运行在 macOS；Linux worker 容器不安装 MLX。
-已下载 `qwen3:4b`、`bge-m3` 后，开启 Ollama 应用即可提供接口。
-
-MLX Whisper 需要在 Mac 单独启动 HTTP 桥接服务：
-
-```bash
-# 从 ai-processing-service/ 执行；已有兼容虚拟环境也可复用
-python3 -m venv .venv-native
-source .venv-native/bin/activate
-pip install -r native/requirements.txt
-# 若尚未安装 ffmpeg：brew install ffmpeg
-python native/transcription_server.py
-```
-
-默认监听 `127.0.0.1:8001`，健康检查为 `GET /health`（只检查 HTTP 存活，不加载模型）。
-转写接口为 `POST /v1/audio/transcriptions`，字段 `file` 和 `model`。
-默认只允许配置的 `mlx-community/whisper-small-mlx` 模型；首次使用缺少缓存时会下载。
-每次转写在单独子进程执行，退出后释放模型内存；同一时间只接受一个转写任务。
-最多接收 5 MiB 音频，临时文件在请求结束后清除。
-
-### Docker worker 调用 Mac
-
-在容器环境覆盖（不是修改 Mac 原生服务使用的地址）：
-
-```dotenv
-AI_CONTENT_URL=http://content-api:8000
-AI_SUMMARY_URL=http://host.docker.internal:11434/api/chat
-AI_EMBEDDING_URL=http://host.docker.internal:11434/api/embed
-AI_TRANSCRIPTION_URL=http://host.docker.internal:8001/v1/audio/transcriptions
-```
-
-原生转写服务如需监听非 loopback，设置 `AI_TRANSCRIPTION_BIND=0.0.0.0`，
-同时给 Mac 服务和 worker 配置相同的非空 `AI_TRANSCRIPTION_KEY`。
-Ollama 如无法从容器访问，需要调整本机 Ollama 的监听配置并限制局域网访问。
-根 Compose 尚未加入 AI worker，本次只提供模型对接代码和容器调用配置说明。
-
-HTTP 超时默认 300 秒，超时不保证服务端计算立即停止；Mac 睡眠或模型服务未启动会导致调用失败。
-多个 worker / Search 同时调用模型时仍可能出现资源竞争，当前建议一次处理一个任务。
-
-本机若已有 RabbitMQ 占用 5672，可在根 `.env` 设置 `RABBITMQ_HOST_PORT=5673`、
-`RABBITMQ_MANAGEMENT_PORT=15673`，并确保宿主机 `STUDYHUB_AMQP_URL` 使用该端口。
-Compose 内部通信仍使用 `rabbitmq:5672`。
+Tests use fake models, Content responses and an in-memory job store. They cover
+redelivery, delivery recovery, failure limits, deletion, chunk offsets, provider
+formats and pipeline behavior. Native HTTP bridge tests require its Web dependencies
+and do not load MLX. Unit tests do not establish real model, database or broker connectivity.
