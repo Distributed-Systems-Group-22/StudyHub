@@ -12,6 +12,8 @@ from app.schemas import SummaryRequest, SummaryJobResponse
 from app.services.cache import generate_versioned_cache_key
 from app.services.job_execution import verify_source_snapshot
 from app.services.content_client import ContentServiceUnavailable
+from app.services.ai_client import get_generation_config
+from app.services.errors import SynthesisError
 
 
 router = APIRouter(
@@ -79,7 +81,7 @@ def find_cached_job(cur, user_id, cache_key, versions):
 
     for candidate in candidates:
         cur.execute("""
-            SELECT document_id, document_version
+            SELECT DISTINCT document_id, document_version
             FROM summary_sources
             WHERE summary_id = %s
         """, (candidate["summary_id"],))
@@ -178,11 +180,16 @@ def create_summary(
         for doc_id, version in versions.items()
     ]
 
-    cache_key = generate_versioned_cache_key(
-        user_id=user_id,
-        documents=documents,
-        instruction=request.instruction
-    )
+    try:
+        generation_config = get_generation_config()
+        cache_key = generate_versioned_cache_key(
+            user_id=user_id,
+            documents=documents,
+            instruction=request.instruction,
+            generation_config=generation_config,
+        )
+    except (SynthesisError, ValueError) as error:
+        raise HTTPException(status_code=503, detail="Generation configuration unavailable") from error
 
     # --------------------------------------------------------
     # Step 4: Cache lookup and concurrent deduplication.
@@ -249,10 +256,12 @@ def create_summary(
                         cache_key,
                         document_ids,
                         instruction,
+                        document_versions,
+                        generation_config,
                         status
                     )
                     VALUES (
-                        %s, %s, %s, %s, %s, 'PENDING'
+                        %s, %s, %s, %s, %s, %s, %s, 'PENDING'
                     )
                     ON CONFLICT (user_id, cache_key)
                     WHERE status IN ('PENDING', 'RUNNING')
@@ -263,7 +272,9 @@ def create_summary(
                     user_id,
                     cache_key,
                     Jsonb(request.document_ids),
-                    request.instruction
+                    request.instruction,
+                    Jsonb(versions),
+                    Jsonb(generation_config),
                 ))
 
                 inserted = cur.fetchone()

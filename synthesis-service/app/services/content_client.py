@@ -87,6 +87,8 @@ def verify_document_access(
             "Content Service returned invalid JSON"
         ) from error
 
+    if not isinstance(data, dict):
+        raise ContentServiceUnavailable("Content Service returned a non-object response")
     documents = data.get("documents")
 
     if not isinstance(documents, list):

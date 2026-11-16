@@ -2,7 +2,7 @@
 
 Group 22 · COMP41720 Distributed Systems
 
-This repository currently implements the Content & Metadata Service: file upload/storage, owner-only metadata access, soft deletion, batch access checks, and processing-result callbacks. A separate relay publishes upload and deletion events from the PostgreSQL outbox to RabbitMQ. It does not run AI processing, search, or synthesis workers.
+This repository implements the Content & Metadata Service and the Synthesis Service. Content handles file storage, owner-only access, soft deletion and processing callbacks; Synthesis handles version-pinned summary jobs, citations, caching and Ollama generation. Both use PostgreSQL outboxes and RabbitMQ. AI Processing and Search remain external dependencies. See [Synthesis setup and limits](synthesis-service/README.md).
 
 ## Team responsibilities
 
@@ -335,6 +335,6 @@ These steps test the Content API and publication path, using manual requests in 
 
 ## Current handoff scope
 
-Implemented here: containerized Content & Metadata Service and Synthesis Service, PostgreSQL databases (`studyhub` and `synthesis_db`), shared RabbitMQ 4 broker, transactional outboxes and relays, owner-only document upload/read/soft-delete, live permission/access check client, multi-document async summary generation with Ollama AI fallback, lease-based worker concurrency, bounded retries, and event-driven cache invalidation upon document deletion.
+Implemented here: containerized Content & Metadata Service and Synthesis Service, PostgreSQL databases (`studyhub` and `synthesis_db`), shared RabbitMQ 4 broker, transactional outboxes and relays, owner-only document upload/read/soft-delete, live permission/access checks, version/configuration-pinned asynchronous summaries with Ollama, verified citation identities, bounded hierarchical summarization, renewable worker claims, bounded retries, and deletion-driven cache invalidation. Development fixtures require explicit mock mode; Search is not integrated.
 
 Not implemented here: AI Processing Service (single-doc transcription/embeddings) and Search & Index Service (vector retrieval), Gateway/login, frontend, and Prometheus/Grafana monitoring dashboard.

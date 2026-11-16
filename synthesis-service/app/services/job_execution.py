@@ -1,440 +1,240 @@
-
-import os
+﻿import os
+import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
-from app.services.ai_client import generate_summary
-from app.services.mock_documents import get_documents
-from app.services.content_client import verify_document_access
+
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from app.database import get_connection
-
+from app.services.ai_client import generate_summary, ensure_generation_config
+from app.services.cache import generate_versioned_cache_key
+from app.services.content_client import verify_document_access, ContentServiceUnavailable
+from app.services.document_provider import get_document_chunks
+from app.services.errors import (
+    BudgetExceeded, InvalidSourceData, LeaseLost, SourceVersionExpired, SynthesisError,
+)
 
 MAX_ATTEMPTS = 3
 LEASE_SECONDS = 45
+MAX_JOB_SECONDS = int(os.getenv("AI_MAX_JOB_SECONDS", "900"))
+if MAX_JOB_SECONDS < LEASE_SECONDS:
+    raise ValueError("AI_MAX_JOB_SECONDS must be at least LEASE_SECONDS")
 
 
 def claim_job(job_id):
-    """Atomically claim a pending job."""
-
+    """Atomically claim a pending job; no payload is trusted from RabbitMQ."""
     token = uuid4()
-
     with get_connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("""
-                SELECT *
-                FROM synthesis_jobs
-                WHERE job_id = %s
-                FOR UPDATE
-            """, (job_id,))
-
+            cur.execute("SELECT * FROM synthesis_jobs WHERE job_id = %s FOR UPDATE", (job_id,))
             job = cur.fetchone()
-
-            if job is None:
-                print(f"Unknown job {job_id}", flush=True)
+            if job is None or job["status"] != "PENDING":
                 return None
-
-            if job["status"] in ("COMPLETED", "FAILED"):
-                print(
-                    f"Job {job_id} already {job['status']}. Skipping.",
-                    flush=True
-                )
+            if job["next_attempt_at"] > datetime.now(timezone.utc):
                 return None
-
-            if job["status"] == "RUNNING":
-                print(
-                    f"Job {job_id} already RUNNING. Skipping.",
-                    flush=True
-                )
-                return None
-
-            now = datetime.now(timezone.utc)
-
-            if job["next_attempt_at"] > now:
-                print(
-                    f"Job {job_id} not ready yet.",
-                    flush=True
-                )
-                return None
-
-            if job["attempts"] >= MAX_ATTEMPTS:
+            if (job["attempts"] >= MAX_ATTEMPTS or not job["document_ids"]
+                    or not job["instruction"] or not job["document_versions"]
+                    or not job["generation_config"]):
                 cur.execute("""
-                    UPDATE synthesis_jobs
-                    SET status = 'FAILED',
-                        error_message = 'Maximum attempts reached',
-                        updated_at = NOW()
-                    WHERE job_id = %s
+                    UPDATE synthesis_jobs SET status = 'FAILED',
+                        error_message = 'Missing safe job snapshot or maximum attempts reached',
+                        updated_at = NOW() WHERE job_id = %s
                 """, (job_id,))
                 return None
+            cur.execute("""
+                UPDATE synthesis_jobs SET status = 'RUNNING', attempts = attempts + 1,
+                    claim_token = %s, lease_until = NOW() + %s * INTERVAL '1 second',
+                    updated_at = NOW() WHERE job_id = %s
+            """, (token, LEASE_SECONDS, job_id))
+            return {**job, "claim_token": token, "attempt": job["attempts"] + 1}
 
-            if not job["document_ids"] or not job["instruction"]:
-                cur.execute("""
-                    UPDATE synthesis_jobs
-                    SET status = 'FAILED',
-                        error_message = 'Missing job payload',
-                        updated_at = NOW()
-                    WHERE job_id = %s
-                """, (job_id,))
-                return None
 
-            lease_until = now + timedelta(
-                seconds=LEASE_SECONDS
-            )
-
+def renew_lease(job):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
             cur.execute("""
                 UPDATE synthesis_jobs
-                SET status = 'RUNNING',
-                    attempts = attempts + 1,
-                    claim_token = %s,
-                    lease_until = %s,
-                    updated_at = NOW()
-                WHERE job_id = %s
-            """, (
-                token,
-                lease_until,
-                job_id
-            ))
-
-            return {
-                "job_id": job_id,
-                "claim_token": token,
-                "attempt": job["attempts"] + 1,
-                "user_id": job["user_id"],
-                "document_ids": job["document_ids"],
-                "instruction": job["instruction"],
-                "cache_key": job["cache_key"]
-            }
+                SET lease_until = NOW() + %s * INTERVAL '1 second', updated_at = NOW()
+                WHERE job_id = %s AND status = 'RUNNING' AND claim_token = %s
+                  AND lease_until > NOW()
+                RETURNING job_id
+            """, (LEASE_SECONDS, job["job_id"], job["claim_token"]))
+            return cur.fetchone() is not None
 
 
-def generate_mock_summary(job):
-    """Simulate work. Replace with AI in Stage 3C-2."""
+@contextmanager
+def job_lease(job, cancelled):
+    stopped, lost = threading.Event(), threading.Event()
+    deadline = time.monotonic() + MAX_JOB_SECONDS
 
-    instruction = job["instruction"]
-    attempt = job["attempt"]
+    def checkpoint():
+        if cancelled.is_set() or lost.is_set():
+            raise LeaseLost("Worker no longer owns a live delivery/lease")
+        if time.monotonic() >= deadline:
+            raise BudgetExceeded("Maximum job execution time reached")
 
-    print(
-        f"Executing job {job['job_id']}, attempt {attempt}",
-        flush=True
-    )
+    def heartbeat():
+        while not stopped.wait(LEASE_SECONDS / 3):
+            if cancelled.is_set() or time.monotonic() >= deadline:
+                return
+            try:
+                if not renew_lease(job):
+                    lost.set()
+                    return
+            except Exception as error:
+                print(f"Lease renewal failed for {job['job_id']}: {type(error).__name__}", flush=True)
+                lost.set()
+                return
 
-    # Fault injection for local testing only.
-    if "TEST_CRASH_ONCE" in instruction and attempt == 1:
-        print("Simulating worker crash!", flush=True)
-        os._exit(17)
-
-    if "TEST_FAIL_ONCE" in instruction and attempt == 1:
-        raise RuntimeError("Simulated transient AI failure")
-
-    time.sleep(1)
-
-    return (
-        "[MOCK SUMMARY - NOT AI GENERATED]\n"
-        f"Documents: {', '.join(job['document_ids'])}\n"
-        f"Instruction: {instruction}\n"
-        f"Completed on attempt {attempt}."
-    )
+    thread = threading.Thread(target=heartbeat, daemon=True)
+    thread.start()
+    try:
+        checkpoint()
+        yield checkpoint
+    finally:
+        stopped.set()
+        thread.join(timeout=15)
 
 
-def complete_job(
-    job,
-    summary_text,
-    model_version,
-    prompt_version,
-    sources=None
-):
-    """Commit result and completion atomically."""
+def lock_source_documents(cur, document_ids):
+    # Same transaction locks are used by deletion handling to serialize insertion.
+    for doc_id in sorted(document_ids):
+        cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (doc_id,))
 
+
+def complete_job(job, summary_text, model_version, prompt_version, sources, citations):
+    """Commit result, all source dependencies and verified citations atomically."""
+    if (model_version != job["generation_config"]["model_revision"]
+            or prompt_version != job["generation_config"]["prompt_version"]):
+        raise InvalidSourceData("Result configuration differs from the job snapshot")
     summary_id = uuid4()
     with get_connection() as conn:
         with conn.cursor() as cur:
-
+            lock_source_documents(cur, job["document_ids"])
+            cur.execute("SELECT document_id FROM synthesis_deleted_documents WHERE document_id = ANY(%s)",
+                        (job["document_ids"],))
+            if cur.fetchone():
+                raise PermissionError("permission_revoked: source was deleted")
             cur.execute("""
-                UPDATE synthesis_jobs
-                SET status = 'COMPLETED',
-                    completed_at = NOW(),
-                    lease_until = NULL,
-                    claim_token = NULL,
-                    error_message = NULL,
-                    updated_at = NOW()
-                WHERE job_id = %s
-                  AND status = 'RUNNING'
-                  AND claim_token = %s
-                  AND lease_until > NOW()
+                UPDATE synthesis_jobs SET status = 'COMPLETED', completed_at = NOW(),
+                    lease_until = NULL, claim_token = NULL, error_message = NULL, updated_at = NOW()
+                WHERE job_id = %s AND status = 'RUNNING' AND claim_token = %s AND lease_until > NOW()
                 RETURNING job_id
-            """, (
-                job["job_id"],
-                job["claim_token"]
-            ))
-
+            """, (job["job_id"], job["claim_token"]))
             if cur.fetchone() is None:
-                print(
-                    f"Stale completion rejected: {job['job_id']}",
-                    flush=True
-                )
                 return False
-
             cur.execute("""
-                INSERT INTO synthesis_results (
-                    summary_id,
-                    job_id,
-                    cache_key,
-                    summary_text,
-                    model_version,
-                    prompt_version,
-                    status
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, 'VALID')
-            """, (
-                summary_id,
-                job["job_id"],
-                job["cache_key"],
-                summary_text,
-                model_version,
-                prompt_version
-            ))
-
-            if sources:
-                for src in sources:
-                    doc_id = src.get("documentId") or src.get("document_id")
-                    doc_ver = src.get("documentVersion") or src.get("document_version", 1)
-                    cur.execute("""
-                        INSERT INTO summary_sources (
-                            summary_id,
-                            document_id,
-                            document_version
-                        )
-                        VALUES (%s, %s, %s)
-                    """, (summary_id, str(doc_id), doc_ver))
-
-    print(
-        f"Job {job['job_id']} COMPLETED",
-        flush=True
-    )
+                INSERT INTO synthesis_results
+                    (summary_id, job_id, cache_key, summary_text, model_version, prompt_version, citations, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'VALID')
+            """, (summary_id, job["job_id"], job["cache_key"], summary_text,
+                  model_version, prompt_version, Jsonb(citations)))
+            # Record all inputs, including uncited ones, for permissions/invalidation.
+            for chunk in sources:
+                cur.execute("""
+                    INSERT INTO summary_sources
+                        (summary_id, document_id, document_version, chunk_id, page, source_location)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (summary_id, chunk.document_id, chunk.document_version,
+                      chunk.chunk_id, chunk.page, chunk.source_location))
     return True
 
 
 def fail_job(job, error):
-    """Persist a failure and schedule a bounded retry."""
-
+    """Permanent errors fail immediately; transient errors keep bounded backoff."""
+    permanent = (isinstance(error, PermissionError)
+                 or isinstance(error, SynthesisError) and not error.retryable)
     with get_connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("""
-                SELECT status, claim_token, attempts,
-                       lease_until
-                FROM synthesis_jobs
-                WHERE job_id = %s
-                FOR UPDATE
+                SELECT status, claim_token, attempts, lease_until
+                FROM synthesis_jobs WHERE job_id = %s FOR UPDATE
             """, (job["job_id"],))
-
             current = cur.fetchone()
-
-            if (
-                current is None
-                or current["status"] != "RUNNING"
-                or current["claim_token"] != job["claim_token"]
-                or current["lease_until"]
-                   <= datetime.now(timezone.utc)
-            ):
-                print(
-                    f"Stale failure ignored: {job['job_id']}",
-                    flush=True
-                )
+            if (current is None or current["status"] != "RUNNING"
+                    or current["claim_token"] != job["claim_token"]
+                    or current["lease_until"] <= datetime.now(timezone.utc)):
                 return
-
-            if current["attempts"] >= MAX_ATTEMPTS:
+            if permanent or current["attempts"] >= MAX_ATTEMPTS:
                 cur.execute("""
-                    UPDATE synthesis_jobs
-                    SET status = 'FAILED',
-                        claim_token = NULL,
-                        lease_until = NULL,
-                        error_message = %s,
-                        updated_at = NOW()
+                    UPDATE synthesis_jobs SET status = 'FAILED', claim_token = NULL,
+                        lease_until = NULL, error_message = %s, updated_at = NOW()
                     WHERE job_id = %s
                 """, (str(error)[:500], job["job_id"]))
-
-                print(
-                    f"Job {job['job_id']} FAILED permanently",
-                    flush=True
-                )
                 return
-
-            delay = 2 ** current["attempts"]
-            retry_at = (
-                datetime.now(timezone.utc)
-                + timedelta(seconds=delay)
-            )
-
+            retry_at = datetime.now(timezone.utc) + timedelta(seconds=2 ** current["attempts"])
             cur.execute("""
-                UPDATE synthesis_jobs
-                SET status = 'PENDING',
-                    claim_token = NULL,
-                    lease_until = NULL,
-                    next_attempt_at = %s,
-                    error_message = %s,
-                    updated_at = NOW()
-                WHERE job_id = %s
-            """, (
-                retry_at,
-                str(error)[:500],
-                job["job_id"]
-            ))
-
+                UPDATE synthesis_jobs SET status = 'PENDING', claim_token = NULL, lease_until = NULL,
+                    next_attempt_at = %s, error_message = %s, updated_at = NOW() WHERE job_id = %s
+            """, (retry_at, str(error)[:500], job["job_id"]))
             event_id = uuid4()
-
-            payload = {
-                "event_id": str(event_id),
-                "event_type": "synthesis.requested",
-                "job_id": str(job["job_id"])
-            }
-
+            payload = {"event_id": str(event_id), "event_type": "synthesis.requested", "job_id": str(job["job_id"])}
             cur.execute("""
-                INSERT INTO outbox_events (
-                    event_id,
-                    event_type,
-                    aggregate_id,
-                    payload,
-                    available_at
-                )
+                INSERT INTO outbox_events (event_id, event_type, aggregate_id, payload, available_at)
                 VALUES (%s, %s, %s, %s, %s)
-            """, (
-                event_id,
-                "synthesis.requested",
-                job["job_id"],
-                Jsonb(payload),
-                retry_at
-            ))
-
-    print(
-        f"Job {job['job_id']} retry scheduled in {delay}s",
-        flush=True
-    )
-
+            """, (event_id, "synthesis.requested", job["job_id"], Jsonb(payload), retry_at))
 
 
 def verify_source_snapshot(user_id, document_ids):
-    """Verify access to every document and capture its version."""
-
-    verified_docs = verify_document_access(
-        user_id=user_id,
-        document_ids=document_ids
-    )
-
-    requested = {str(doc_id) for doc_id in document_ids}
-
+    verified_docs = verify_document_access(user_id=user_id, document_ids=document_ids)
+    requested = set(document_ids)
     verified = {}
-
     for doc in verified_docs:
-        doc_id = str(doc["documentId"])
-        version = doc["documentVersion"]
-
-        if doc_id not in requested:
-            raise ValueError("Unexpected document in access response")
-
-        if (
-            not isinstance(version, int)
-            or isinstance(version, bool)
-            or version < 1
-        ):
-            raise ValueError("Invalid document version")
-
-        if doc_id in verified:
-            raise ValueError("Duplicate document in access response")
-
+        if not isinstance(doc, dict):
+            raise ContentServiceUnavailable("Malformed access response")
+        doc_id, version = doc.get("documentId"), doc.get("documentVersion")
+        if (not isinstance(doc_id, str) or doc_id not in requested or doc_id in verified
+                or type(version) is not int or version < 1):
+            raise ContentServiceUnavailable("Invalid source metadata in access response")
         verified[doc_id] = version
-
     if set(verified) != requested:
-        raise PermissionError(
-            "One or more documents are unavailable or unauthorized"
-        )
-
+        raise PermissionError("permission_revoked: one or more documents are missing or unauthorized")
     return verified
 
 
+def validate_job_snapshot(job):
+    versions = job.get("document_versions")
+    if (not isinstance(versions, dict) or set(versions) != set(job["document_ids"])
+            or len(job["document_ids"]) != len(versions)
+            or any(type(v) is not int or v < 1 for v in versions.values())
+            or not isinstance(job.get("generation_config"), dict)):
+        raise InvalidSourceData("Legacy or malformed job snapshot; resubmit request")
+    ensure_generation_config(job["generation_config"])
+    key = generate_versioned_cache_key(
+        job["user_id"], [{"documentId": d, "documentVersion": v} for d, v in versions.items()],
+        job["instruction"], job["generation_config"])
+    if key != job["cache_key"]:
+        raise InvalidSourceData("Job snapshot does not match its cache key")
 
-def process_job(job_id):
+
+def process_job(job_id, cancelled=None):
     job = claim_job(job_id)
-
     if job is None:
         return
-
+    cancelled = cancelled if cancelled is not None else threading.Event()
     try:
-        print(
-            f"Executing AI job {job_id}, "
-            f"attempt {job['attempt']}",
-            flush=True
-        )
-
-        user_id = job["user_id"]
-        doc_ids = job["document_ids"]
-
-        # Step 1: Verify permissions and document versions.
-        initial_versions = verify_source_snapshot(
-            user_id=user_id,
-            document_ids=doc_ids
-        )
-
-        print(
-            f"Initial document versions: {initial_versions}",
-            flush=True
-        )
-
-        # Step 2: Retrieve source content.
-        # Real Search Service integration is still pending.
-        documents = get_documents(doc_ids)
-
-        # Step 3: Generate summary with Ollama.
-        result = generate_summary(
-            documents=documents,
-            instruction=job["instruction"]
-        )
-
-        # Step 4: Verify permissions and versions again.
-        current_versions = verify_source_snapshot(
-            user_id=user_id,
-            document_ids=doc_ids
-        )
-
-        if current_versions != initial_versions:
-            raise RuntimeError(
-                "Document permissions or versions changed "
-                "during summary generation"
-            )
-
-        # Step 5: Save verified source metadata.
-        sources = [
-            {
-                "documentId": doc_id,
-                "documentVersion": version
-            }
-            for doc_id, version in initial_versions.items()
-        ]
-
-        completed = complete_job(
-            job=job,
-            summary_text=result["summary_text"],
-            model_version=result["model_version"],
-            prompt_version=result["prompt_version"],
-            sources=sources
-        )
-
-        if completed:
-            print(
-                f"AI summary saved for job {job_id}",
-                flush=True
-            )
-        else:
-            print(
-                f"AI result discarded for job {job_id}: "
-                "lease or claim expired",
-                flush=True
-            )
-
+        with job_lease(job, cancelled) as checkpoint:
+            validate_job_snapshot(job)
+            versions = job["document_versions"]
+            if verify_source_snapshot(job["user_id"], job["document_ids"]) != versions:
+                raise SourceVersionExpired("Sources changed while this job was queued; resubmit")
+            chunks = get_document_chunks(job["document_ids"], versions, user_id=job["user_id"])
+            checkpoint()
+            result = generate_summary(chunks, job["instruction"], job["generation_config"], checkpoint)
+            ensure_generation_config(job["generation_config"])
+            if verify_source_snapshot(job["user_id"], job["document_ids"]) != versions:
+                raise SourceVersionExpired("Sources changed during generation; resubmit")
+            checkpoint()
+            completed = complete_job(
+                job, result["summary_text"], result["model_version"], result["prompt_version"],
+                chunks, result["citations"])
+            print(f"Job {job_id}: {'completed' if completed else 'stale result discarded'}", flush=True)
+    except LeaseLost as error:
+        # Stop renewing; Recovery will retry if this worker lost its delivery/lease.
+        print(f"Job {job_id}: {error}", flush=True)
     except Exception as error:
-        print(
-            f"AI job {job_id} failed: {error}",
-            flush=True
-        )
-
+        print(f"Job {job_id} failed: {error}", flush=True)
         fail_job(job, error)

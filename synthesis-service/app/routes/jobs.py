@@ -83,6 +83,7 @@ def get_job_status(
                         j.error_message,
                         r.summary_id,
                         r.summary_text,
+                        r.citations,
                         r.status AS summary_status
                     FROM synthesis_jobs j
                     LEFT JOIN synthesis_results r
@@ -102,6 +103,7 @@ def get_job_status(
                 # No summary should be exposed until completion.
                 if job["status"] != "COMPLETED":
                     job["summary_text"] = None
+                    job["citations"] = None
                     return JobStatusResponse(**job)
 
                 # Fail closed if the result is missing or invalidated.

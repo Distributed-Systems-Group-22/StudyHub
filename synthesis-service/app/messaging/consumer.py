@@ -2,16 +2,19 @@
 import json
 import os
 import time
+import threading
+from functools import partial
 from uuid import UUID
 
 import pika
 import psycopg
 
-from app.services.job_execution import process_job
+from app.services.job_execution import process_job, lock_source_documents
 
 
 QUEUE_NAME = "synthesis.jobs"
 DOCUMENT_EVENTS_QUEUE = "synthesis.document-events"
+ACTIVE_JOBS = set()
 
 
 def connect_rabbitmq():
@@ -35,6 +38,9 @@ def on_message(channel, method, properties, body):
     try:
         event = json.loads(body)
 
+        if not isinstance(event, dict):
+            raise ValueError("Event must be a JSON object")
+
         if event.get("event_type") != "synthesis.requested":
             raise ValueError("Unsupported event type")
 
@@ -49,29 +55,33 @@ def on_message(channel, method, properties, body):
         )
         return
 
-    try:
-        process_job(job_id)
+    cancelled = threading.Event()
+    ACTIVE_JOBS.add(cancelled)
 
-        # ACK after database transactions succeed.
-        channel.basic_ack(
-            delivery_tag=method.delivery_tag
-        )
+    def finish(error):
+        ACTIVE_JOBS.discard(cancelled)
+        if not channel.is_open:
+            cancelled.set()
+            return
+        if error is None:
+            channel.basic_ack(delivery_tag=method.delivery_tag)
+        else:
+            print(f"Worker infrastructure error: {error}", flush=True)
+            channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
-    except Exception as error:
-        print(
-            f"Worker infrastructure error: {error}",
-            flush=True
-        )
+    def work():
+        failure = None
+        try:
+            process_job(job_id, cancelled)
+        except Exception as error:
+            failure = error
+        try:
+            # Pika I/O and ACKs remain on the connection thread during inference.
+            channel.connection.add_callback_threadsafe(partial(finish, failure))
+        except pika.exceptions.ConnectionWrongStateError:
+            cancelled.set()
 
-        # Temporary infrastructure retry policy.
-        # Stage 3C-1 test focuses on job execution
-        # failures and worker crashes.
-        time.sleep(2)
-
-        channel.basic_nack(
-            delivery_tag=method.delivery_tag,
-            requeue=True
-        )
+    threading.Thread(target=work, daemon=True).start()
 
 
 def on_document_event(channel, method, properties, body):
@@ -120,6 +130,17 @@ def on_document_event(channel, method, properties, body):
 
         with get_connection() as conn:
             with conn.cursor() as cur:
+                lock_source_documents(cur, [doc_id])
+                cur.execute("""
+                    INSERT INTO synthesis_deleted_documents(document_id)
+                    VALUES (%s) ON CONFLICT DO NOTHING
+                """, (doc_id,))
+                cur.execute("""
+                    UPDATE synthesis_jobs
+                    SET status = 'FAILED', claim_token = NULL, lease_until = NULL,
+                        error_message = 'permission_revoked: source deleted', updated_at = NOW()
+                    WHERE status IN ('PENDING', 'RUNNING') AND document_ids ? %s
+                """, (doc_id,))
                 cur.execute("""
                     UPDATE synthesis_results
                     SET status = 'INVALIDATED'
@@ -236,6 +257,9 @@ def main():
             time.sleep(5)
 
         finally:
+            for cancelled in ACTIVE_JOBS:
+                cancelled.set()
+            ACTIVE_JOBS.clear()
             if connection is not None and connection.is_open:
                 connection.close()
 

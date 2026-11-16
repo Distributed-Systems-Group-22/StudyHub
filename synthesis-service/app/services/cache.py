@@ -2,17 +2,10 @@
 import hashlib
 import json
 
-from app.services.ai_client import (
-    AI_MODEL,
-    PROMPT_VERSION,
-)
+from app.services.ai_client import get_generation_config
 
 
-# Temporary contract until Search Service exposes
-# a stable retrieval/index version.
-RETRIEVAL_VERSION = "retrieval-v1"
-
-CACHE_SCHEMA_VERSION = "version-aware-v1"
+CACHE_SCHEMA_VERSION = "version-aware-v2"
 
 
 def _hash_payload(payload: dict) -> str:
@@ -29,7 +22,8 @@ def _hash_payload(payload: dict) -> str:
 def generate_versioned_cache_key(
     user_id: str,
     documents: list[dict],
-    instruction: str
+    instruction: str,
+    generation_config: dict | None = None,
 ) -> str:
     """
     Generate a cache key using verified document versions.
@@ -93,29 +87,12 @@ def generate_versioned_cache_key(
         "user_id": user_id.strip(),
         "documents": normalized_documents,
         "instruction": instruction.strip(),
-        "model_version": AI_MODEL,
-        "prompt_version": PROMPT_VERSION,
-        "retrieval_version": RETRIEVAL_VERSION
+        "generation_config": generation_config if generation_config is not None else get_generation_config(),
     }
 
     return _hash_payload(payload)
 
 
-# Legacy function retained temporarily so existing
-# job creation continues working during Stage 4A.
-# Do NOT use these keys for cache hits.
-def generate_cache_key(
-    user_id: str,
-    document_ids: list[str],
-    instruction: str
-) -> str:
-    payload = {
-        "user_id": user_id,
-        "documents": sorted(document_ids),
-        "instruction": instruction.strip(),
-        "model_version": "mock-model-v1",
-        "prompt_version": "prompt-v1",
-        "retrieval_version": RETRIEVAL_VERSION
-    }
-
-    return _hash_payload(payload)
+def generate_cache_key(user_id: str, document_ids: list[str], instruction: str) -> str:
+    """Legacy callers must supply verified versions via generate_versioned_cache_key."""
+    raise ValueError("Unversioned cache keys are unsafe; use generate_versioned_cache_key")

@@ -18,6 +18,15 @@ class SummaryRequest(BaseModel):
     @field_validator("document_ids")
     @classmethod
     def validate_document_ids(cls, values):
+        normalized = []
+        for value in values:
+            value = value.strip()
+            try:
+                value = str(UUID(value))
+            except ValueError:
+                pass
+            normalized.append(value)
+        values = normalized
         if any(not value.strip() for value in values):
             raise ValueError("Document IDs cannot be empty")
 
@@ -25,6 +34,14 @@ class SummaryRequest(BaseModel):
             raise ValueError("Duplicate document IDs are not allowed")
 
         return values
+
+    @field_validator("instruction")
+    @classmethod
+    def validate_instruction(cls, value):
+        value = value.strip()
+        if not value:
+            raise ValueError("Instruction cannot be blank")
+        return value
 
 
 class SummaryJobResponse(BaseModel):
@@ -40,3 +57,13 @@ class JobStatusResponse(BaseModel):
     error_message: str | None = None
     summary_text: str | None = None
     summary_status: str | None = None
+    citations: list["Citation"] | None = None
+
+
+class Citation(BaseModel):
+    source_id: str
+    document_id: str
+    document_version: int
+    chunk_id: str
+    page: int | None = None
+    source_location: str | None = None

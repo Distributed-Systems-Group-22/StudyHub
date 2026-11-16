@@ -14,9 +14,22 @@ x-synthesis: &synthesis
     RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS}
     CONTENT_SERVICE_URL: http://content-api:8000
     STUDYHUB_SYNTHESIS_TOKEN: ${STUDYHUB_SYNTHESIS_TOKEN:-}
-    STUDYHUB_DEV_IDENTITY: ${STUDYHUB_DEV_IDENTITY:-1}
+    STUDYHUB_DEV_IDENTITY: ${STUDYHUB_DEV_IDENTITY:-0}
     OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
     AI_MODEL: ${AI_MODEL:-llama3.2:1b}
+    DOCUMENT_PROVIDER: ${DOCUMENT_PROVIDER:-search}
+    MOCK_DOCUMENTS_FILE: ${MOCK_DOCUMENTS_FILE:-}
+    SEARCH_SERVICE_URL: ${SEARCH_SERVICE_URL:-}
+    STUDYHUB_SEARCH_TOKEN: ${STUDYHUB_SEARCH_TOKEN:-}
+    RETRIEVAL_VERSION: ${RETRIEVAL_VERSION:-search-contract-pending-v1}
+    AI_CONTEXT_SIZE: ${AI_CONTEXT_SIZE:-4096}
+    AI_OUTPUT_TOKENS: ${AI_OUTPUT_TOKENS:-384}
+    AI_TEMPERATURE: ${AI_TEMPERATURE:-0.2}
+    AI_SEED: ${AI_SEED:-42}
+    AI_TIMEOUT_SECONDS: ${AI_TIMEOUT_SECONDS:-120}
+    AI_MAX_CALLS: ${AI_MAX_CALLS:-64}
+    AI_MAX_SOURCE_BYTES: ${AI_MAX_SOURCE_BYTES:-2000000}
+    AI_MAX_JOB_SECONDS: ${AI_MAX_JOB_SECONDS:-900}
 
 services:
   db:
@@ -122,6 +135,7 @@ services:
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     volumes:
       - ./synthesis-service/app:/app/app
+      - ./synthesis-service/migrations:/app/migrations:ro
     depends_on:
       synthesis-db:
         condition: service_healthy
@@ -140,6 +154,8 @@ services:
     volumes:
       - ./synthesis-service/app:/app/app
     depends_on:
+      synthesis-api:
+        condition: service_healthy
       synthesis-db:
         condition: service_healthy
       rabbitmq:
@@ -152,6 +168,8 @@ services:
     volumes:
       - ./synthesis-service/app:/app/app
     depends_on:
+      synthesis-api:
+        condition: service_healthy
       synthesis-db:
         condition: service_healthy
       rabbitmq:
@@ -164,6 +182,8 @@ services:
     volumes:
       - ./synthesis-service/app:/app/app
     depends_on:
+      synthesis-api:
+        condition: service_healthy
       synthesis-db:
         condition: service_healthy
     restart: unless-stopped
