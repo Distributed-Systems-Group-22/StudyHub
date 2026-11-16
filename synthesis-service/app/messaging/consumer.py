@@ -209,7 +209,7 @@ def main():
                 queue=DOCUMENT_EVENTS_QUEUE,
                 durable=True
             )
-            
+
             # Content Service publishes deletion events.
             channel.exchange_declare(
                 exchange="document.events",

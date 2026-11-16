@@ -2,11 +2,11 @@
 
 Group 22 · COMP41720 Distributed Systems
 
-This repository implements the Content & Metadata Service and the Synthesis Service. Content handles file storage, owner-only access, soft deletion and processing callbacks; Synthesis handles version-pinned summary jobs, citations, caching and Ollama generation. Both use PostgreSQL outboxes and RabbitMQ. AI Processing and Search remain external dependencies. See [Synthesis setup and limits](synthesis-service/README.md).
+This repository implements the Content & Metadata Service, AI Processing Service, and Synthesis Service. Content handles file storage, owner-only access, soft deletion and processing callbacks; Synthesis handles version-pinned summary jobs, citations, caching and Ollama generation. Both use PostgreSQL outboxes and RabbitMQ. AI Processing runs as an optional worker using native Mac model services; Search remains an external dependency. See [AI Processing setup](ai-processing-service/README.md) and [Synthesis setup and limits](synthesis-service/README.md).
 
 ## Team responsibilities
 
-The table describes the team's planned service ownership and ADR topics, not features all implemented in this checkout. Only the Content implementation is present; the other services and ADR documents are not included here.
+The table describes the team's planned service ownership and ADR topics, not features all implemented in this checkout. Content, AI Processing and Synthesis implementations are present; Search and the ADR documents are not included here.
 
 | Team member | Service | Responsibilities | Architecture decision (ADR) |
 | --- | --- | --- | --- |
@@ -33,12 +33,13 @@ The table describes the team's planned service ownership and ADR topics, not fea
 | `synthesis-service/Dockerfile` | Python 3.12 container image for synthesis services |
 | `setup/setup-content-service.ps1`, `setup/setup-content-service.sh` | Create local configuration and fill missing service tokens |
 | `setup/start-content-service.ps1`, `setup/start-content-service.sh` | Run Compose in the background |
-| `compose.yaml` | PostgreSQL (Content & Synthesis), RabbitMQ, Content, and Synthesis service containers |
+| `ai-processing-service/` | Document processing worker, native MLX bridge, migrations and tests |
+| `compose.yaml` | Content, Synthesis, PostgreSQL, RabbitMQ, and an optional AI Processing worker |
 | `.env.example` | Local configuration template |
 | `content-service/requirements.txt` | Content Python dependencies |
 | `synthesis-service/requirements.txt` | Synthesis Python dependencies |
 
-Root `.env`, `uploads/`, and any local `.venv/` are excluded from Git. Compose bind-mounts `./uploads` into the API container at `/data/uploads`; this is a host directory, not a Docker named volume. No `docs/` directory or placeholder directories for the other three services remain in this checkout.
+Root `.env`, `uploads/`, and any local `.venv/` are excluded from Git. Compose bind-mounts `./uploads` into the API container at `/data/uploads`; this is a host directory, not a Docker named volume. No `docs/` directory or Search implementation is included in this checkout.
 
 ## Run the Content Service locally
 
@@ -70,7 +71,7 @@ docker compose up --build -d
 
 Setup only prepares configuration: it copies `.env.example` when `.env` is missing and generates missing or blank Processing, Search, and Synthesis tokens. Existing nonempty tokens are preserved. It does not install host dependencies, start Docker, or run migrations. Keep `.env` out of Git and give each calling service only its own matching token.
 
-For subsequent starts, run `docker compose up --build -d` directly; the setup script is only needed to initialize configuration or fill missing tokens. The existing `start-content-service.ps1` and `start-content-service.sh` scripts remain optional shortcuts for the same Compose command. Compose defines these five services:
+For subsequent starts, run `docker compose up --build -d` directly; the setup script is only needed to initialize configuration or fill missing tokens. The existing `start-content-service.ps1` and `start-content-service.sh` scripts remain optional shortcuts for the same Compose command. Compose defines the following services; `ai-processing-worker` requires the `processing` profile:
 
 | Compose service | Purpose | Startup dependency |
 | --- | --- | --- |
@@ -79,6 +80,7 @@ For subsequent starts, run `docker compose up --build -d` directly; the setup sc
 | `content-migrate` | Apply pending SQL migrations, then exit | Healthy `db` |
 | `content-api` | FastAPI on port 8000 | Successful `content-migrate` |
 | `content-relay` | Publish pending outbox events | Successful `content-migrate` and healthy `rabbitmq` |
+| `ai-processing-worker` | Single-document summaries, transcription and embeddings; optional `processing` profile | Healthy `db`, `rabbitmq` and `content-api` |
 | `synthesis-db` | PostgreSQL 17; Synthesis database (port 5434) | None |
 | `synthesis-api` | FastAPI on port 8002 | Healthy `synthesis-db` and healthy `rabbitmq` |
 | `synthesis-worker` | Synthesis consumer (`synthesis.jobs` & `synthesis.document-events`) | Healthy `synthesis-db` and healthy `rabbitmq` |
@@ -282,7 +284,7 @@ SELECT COUNT(*) AS unpublished_events FROM outbox_events WHERE published_at IS N
 
 ## RabbitMQ integration
 
-The relay declares the durable topic exchange `document.events` and the three durable queues/bindings below. It publishes persistent JSON messages with publisher confirms and `mandatory=True`; the routing key matches `eventType`, and the AMQP `message_id` is `eventId`. The consumers in the table are intended downstream callers, not containers included in this Compose stack.
+The relay declares the durable topic exchange `document.events` and the three durable queues/bindings below. It publishes persistent JSON messages with publisher confirms and `mandatory=True`; the routing key matches `eventType`, and the AMQP `message_id` is `eventId`. AI Processing and Synthesis consumers are included in this checkout; the Processing worker requires its optional Compose profile. Search remains external.
 
 | Event | Queue | Consumer | Expected action |
 | --- | --- | --- | --- |
@@ -307,7 +309,7 @@ Without external consumers, messages remain queued and no AI output, search inde
 
 ## Smoke test
 
-These steps test the Content API and publication path, using manual requests in place of the missing downstream workers. Start the stack, confirm API availability, and obtain your local Processing and Search/Synthesis tokens from `.env`. Use a synthetic nonempty file of at most 5 MiB. The steps below are a repeatable checklist, not evidence that an AI worker processed the file.
+These steps test the Content API and publication path using manual requests in place of downstream processing. Leave the optional Processing worker stopped for this checklist. Start the stack, confirm API availability, and obtain your local Processing and Search/Synthesis tokens from `.env`. Use a synthetic nonempty file of at most 5 MiB. The steps below are a repeatable checklist, not evidence that an AI worker processed the file.
 
 1. In `/docs` (`http://127.0.0.1:8000/docs`), upload a synthetic PDF with `User_Name: alice`. Expect `201` and copy the `documentId`.
 2. Use the same ID to fetch metadata. Expect `200` for Alice and `404` for Bob.
@@ -337,4 +339,6 @@ These steps test the Content API and publication path, using manual requests in 
 
 Implemented here: containerized Content & Metadata Service and Synthesis Service, PostgreSQL databases (`studyhub` and `synthesis_db`), shared RabbitMQ 4 broker, transactional outboxes and relays, owner-only document upload/read/soft-delete, live permission/access checks, version/configuration-pinned asynchronous summaries with Ollama, verified citation identities, bounded hierarchical summarization, renewable worker claims, bounded retries, and deletion-driven cache invalidation. Development fixtures require explicit mock mode; Search is not integrated.
 
-Not implemented here: AI Processing Service (single-doc transcription/embeddings) and Search & Index Service (vector retrieval), Gateway/login, frontend, and Prometheus/Grafana monitoring dashboard.
+AI Processing is also implemented as an optional Docker worker with single-document summaries, transcription through a native Mac bridge, embeddings, durable job tracking and idempotent message handling. Its proposed Search output contract still requires integration. See [AI Processing setup and limits](ai-processing-service/README.md).
+
+Not implemented here: Search & Index Service (vector retrieval), Gateway/login, frontend, and Prometheus/Grafana monitoring dashboard.
