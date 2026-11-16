@@ -24,6 +24,7 @@ app = FastAPI(title='StudyHub Native MLX Transcription')
 
 @app.get('/health')
 def health():
+    """Expose process liveness without allocating model memory."""
     return {'status': 'ok', 'model': MODEL}
 
 
@@ -46,6 +47,7 @@ def transcribe_file(path):
 @app.post('/v1/audio/transcriptions')
 def transcribe(file: UploadFile = File(...), model: str = Form(...),
                authorization: str | None = Header(default=None)):
+    """Authenticate, serialize decoding, and remove all temporary upload artifacts."""
     if TOKEN and not secrets.compare_digest((authorization or '').encode(), f'Bearer {TOKEN}'.encode()):
         raise HTTPException(401, 'Invalid transcription token')
     if model != MODEL:

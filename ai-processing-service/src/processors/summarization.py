@@ -1,3 +1,4 @@
+"""Hierarchical summarization with bounded input groups and reduction depth."""
 def summarize_document(chunks, model_client):
     """Reduce through bounded text groups, including summaries longer than one group."""
     settings = model_client.settings
@@ -7,6 +8,7 @@ def summarize_document(chunks, model_client):
         raise ValueError('Summary context budget is too small')
 
     def split(text):
+        """Avoid silently dropping text when an intermediate summary is too large."""
         return [text[i:i + budget] for i in range(0, len(text), budget)]
 
     summaries = [model_client.summarize(part) for chunk in chunks for part in split(chunk)]

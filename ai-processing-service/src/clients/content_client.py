@@ -1,3 +1,4 @@
+"""Authenticated, version-specific access to Content-owned files and status."""
 from email.message import Message
 import httpx
 
@@ -5,10 +6,12 @@ class DocumentUnavailable(Exception):
     """Deleted, missing or obsolete document version."""
 
 class ContentClient:
+    """Use the Processing token without impersonating an end user."""
     def __init__(self, settings):
         self.settings = settings
 
     def _request(self, method, document_id, version, suffix, **kwargs):
+        """Map unavailable versions to cancellation; propagate other HTTP failures."""
         s = self.settings
         url = f'{s.content_url.rstrip("/")}/internal/documents/{document_id}/versions/{version}/{suffix}'
         with httpx.Client(timeout=s.timeout) as client:
@@ -20,6 +23,7 @@ class ContentClient:
         return response
 
     def download(self, document_id, version):
+        """Recover the original filename from headers for processor selection."""
         response = self._request('GET', document_id, version, 'file')
         disposition = Message()
         disposition['content-disposition'] = response.headers.get('content-disposition', '')
@@ -31,4 +35,5 @@ class ContentClient:
         return response.content, filename
 
     def report(self, document_id, version, status):
+        """Report only final states; Content enforces its terminal-state rules."""
         self._request('PUT', document_id, version, 'processing-status', json={'status': status})

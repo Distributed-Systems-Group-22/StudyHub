@@ -1,8 +1,10 @@
 FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
+# Cache dependency installation separately from application source changes.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+# Native MLX remains on macOS and is not part of this Linux worker image.
 COPY main.py .
 COPY src/ ./src/
 COPY migrations/ ./migrations/

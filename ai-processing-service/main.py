@@ -5,6 +5,7 @@ from src.config import Settings
 
 
 def main():
+    """Validate configuration, initialize owned tables, then run the delivery loop."""
     parser = argparse.ArgumentParser(description='StudyHub AI Processing worker')
     parser.add_argument('--check-config', action='store_true')
     args = parser.parse_args()

@@ -1,3 +1,4 @@
+-- Store one durable workflow per document version, including its stable result event ID.
 CREATE SCHEMA IF NOT EXISTS ai_processing;
 CREATE TABLE IF NOT EXISTS ai_processing.jobs (
     document_id UUID NOT NULL,

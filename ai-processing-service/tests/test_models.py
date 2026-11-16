@@ -1,3 +1,4 @@
+"""Provider wire-format tests with fake model responses."""
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
