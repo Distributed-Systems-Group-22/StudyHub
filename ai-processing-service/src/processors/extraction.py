@@ -1,9 +1,11 @@
+"""Extract readable source text without invoking a generative model."""
 from io import BytesIO
 from pathlib import Path
 
 AUDIO_EXTENSIONS = {'.mp3', '.wav', '.m4a', '.mp4', '.ogg', '.webm', '.flac'}
 
 def extract_text(contents, filename):
+    """Dispatch by extension; scanned PDFs and legacy DOC are intentionally unsupported."""
     suffix = Path(filename).suffix.lower()
     if suffix in {'.txt', '.md', '.csv'}:
         text = contents.decode('utf-8-sig')

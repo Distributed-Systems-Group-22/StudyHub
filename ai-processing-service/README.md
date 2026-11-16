@@ -35,7 +35,11 @@ Do not overwrite existing credentials or replace Synthesis settings with Process
 | `AI_TRANSCRIPTION_URL`, `AI_TRANSCRIPTION_MODEL`, `AI_TRANSCRIPTION_KEY` | Multipart transcription endpoint, allowed model and optional key |
 | `AI_HTTP_TIMEOUT` | HTTP operation timeout in seconds; default 300 |
 | `AI_CHUNK_SIZE`, `AI_CHUNK_OVERLAP` | Character counts, not token counts; defaults 2000 and 200 |
-| `AI_MAX_ATTEMPTS` | Processing attempts per document version; default 3 |
+| `AI_MAX_ATTEMPTS` | Non-transient failures/crashes per document version; default 3 |
+| `AI_MAX_CHUNKS` | Maximum chunks per document; default 128 |
+| `AI_MAX_MODEL_CALLS` | Shared transcription/summary/embedding call limit per attempt; default 512 |
+| `AI_PROCESSING_MAX_JOB_SECONDS` | Cooperative per-attempt deadline; default 900 seconds |
+| `AI_RETRY_BASE_SECONDS`, `AI_RETRY_MAX_SECONDS` | Outage backoff base and cap; defaults 10 and 300 seconds |
 | `AI_OLLAMA_CONTEXT` | Local summary context size; default 4096 tokens |
 | `AI_SUMMARY_MAX_TOKENS` | Summary output limit; default 512 tokens |
 
@@ -137,6 +141,17 @@ Supported documents are UTF-8 TXT, MD and CSV, text-based PDF, and DOCX, includi
 DOCX table text. Supported audio extensions are MP3, WAV, M4A, MP4, OGG, WEBM and FLAC.
 Scanned PDFs require OCR, which is not implemented. Legacy DOC is unsupported.
 Original files are limited to 5 MiB and extracted text to 200000 characters.
+The chunk count is calculated before allocating slices or calling models. Pathological
+chunk size/overlap settings therefore fail before costly work. A shared budget covers
+transcription, summary reduction and embeddings. The deadline is checked at stage and
+network-read boundaries, and model HTTP operation timeouts use the remaining budget.
+It is cooperative, not a hard process kill for synchronous file parsing or a remote
+model that continues computing after a client disconnect. Model cleanup has a separate
+short timeout and does not consume the computation budget.
+
+The new budget/retry settings have safe code defaults. To override them for a Compose
+worker without editing the root Compose file, use an environment override, for example
+`docker compose --profile processing run --rm -e AI_MAX_CHUNKS=64 ai-processing-worker`.
 Summaries and key facts currently share one text field. Embeddings are generated
 from original text chunks, with character offsets retained in each chunk.
 
@@ -145,8 +160,9 @@ from original text chunks, with character offsets retained in each chunk.
 The worker creates its own `ai_processing.jobs` table at startup. Development reuses
 the Content PostgreSQL instance and database through a separate schema; the worker
 does not access Content business tables. Separate database credentials and ownership
-should be configured for an independently deployed service. The current migration
-is idempotent initialization SQL; future schema changes need a migration mechanism.
+should be configured for an independently deployed service. The startup initializer applies the idempotent SQL files in order under a database lock.
+Migration 002 upgrades existing tables with a persistent retry counter and cooldown;
+future migrations must also be repeatable until a migration history runner is added.
 
 Jobs are deduplicated by `(documentId, documentVersion)`. PostgreSQL session advisory
 locks prevent concurrent processing of the same version. Results are persisted
@@ -156,8 +172,16 @@ so redelivery does not repeat successful model work.
 
 A crash after publication but before saving completion can publish the result again.
 The result `eventId` remains stable and Search must consume it idempotently.
-Processing failures consume the configured attempt budget and eventually report
-`failed`. Callback and publication failures retry after at least three seconds,
+Non-transient processing failures consume the configured attempt budget and eventually
+report `failed`. Connection failures, HTTP timeouts, 408, 429 and 5xx responses instead
+refund that attempt, keep the job pending, and persist an exponential cooldown.
+The delay starts at 10 seconds and caps at 300 seconds; a valid `Retry-After` can
+extend it, up to one day. These outage retries do not expire the document. Old jobs
+already reported as terminal failures are not automatically reopened.
+
+Cooldowns survive worker restarts; early redelivery checks the saved timestamp
+without calling models. The current consumer still polls/requeues deferred messages,
+so a dedicated delayed retry queue would improve throughput at larger scales. Callback and publication failures retry after at least three seconds,
 without consuming additional model-processing attempts. Callback 409 responses are
 retried for operator investigation rather than overwriting a terminal status.
 Content 404 responses skip the job and clear staged results. Invalid upload events

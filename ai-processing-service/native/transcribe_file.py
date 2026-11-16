@@ -5,6 +5,7 @@ import sys
 
 
 def main():
+    """Load MLX only in the child process and return text through a private file."""
     import mlx_whisper
     audio, model, output = sys.argv[1:]
     result = mlx_whisper.transcribe(audio, path_or_hf_repo=model)

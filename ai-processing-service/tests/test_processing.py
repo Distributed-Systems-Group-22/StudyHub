@@ -1,5 +1,7 @@
+"""Delivery and pipeline regressions using an in-memory job store."""
 import unittest
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 from uuid import uuid4
@@ -13,6 +15,7 @@ from src.processors.extraction import extract_text
 
 
 class Store:
+    """Mirror persisted attempt and cooldown transitions without external services."""
     def __init__(self):
         self.row = {'state': 'pending', 'attempts': 0, 'result_event_id': uuid4()}
 
@@ -26,8 +29,14 @@ class Store:
     def attempt(self):
         self.row['attempts'] += 1
 
+    def defer(self, delay, error_type):
+        self.row['attempts'] = max(0, self.row['attempts'] - 1)
+        self.row['retry_count'] = self.row.get('retry_count', 0) + 1
+        self.row['next_attempt_at'] = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        self.row['error_type'] = error_type
+
     def save(self, state, result=None, error_type=None):
-        self.row.update(state=state, result=result, error_type=error_type)
+        self.row.update(state=state, result=result, error_type=error_type, next_attempt_at=None)
 
 
 class ProcessingTests(unittest.TestCase):
@@ -95,7 +104,7 @@ class ProcessingTests(unittest.TestCase):
 
     def test_invalid_event_version(self):
         import json
-        for version in (True, 0, '1'):
+        for version in (True, 0, '1', 2147483648):
             with self.assertRaises(ValueError):
                 parse_event(json.dumps({**self.event, 'documentVersion': version}))
 
