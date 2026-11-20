@@ -1,5 +1,5 @@
-"""Native macOS HTTP bridge for the Docker-compatible processing worker.
-Each transcription runs in a child process so exiting releases MLX model memory.
+"""Cross-platform faster-whisper HTTP bridge for the Docker-compatible processing worker.
+Each transcription runs in a child process so exiting releases decoder memory.
 """
 import json
 import os
@@ -14,18 +14,18 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 
 load_dotenv(Path(__file__).resolve().parents[2] / '.env')
-MODEL = os.getenv('AI_TRANSCRIPTION_MODEL', 'mlx-community/whisper-small-mlx').strip()
+MODEL = os.getenv('AI_TRANSCRIPTION_MODEL', 'small').strip()
 TOKEN = os.getenv('AI_TRANSCRIPTION_KEY', '').strip()
 TIMEOUT = float(os.getenv('AI_HTTP_TIMEOUT', '300'))
 MAX_BYTES = 5 * 1024 * 1024
 lock = threading.Lock()
-app = FastAPI(title='StudyHub Native MLX Transcription')
+app = FastAPI(title='StudyHub Faster Whisper Transcription')
 
 
 @app.get('/health')
 def health():
     """Expose process liveness without allocating model memory."""
-    return {'status': 'ok', 'model': MODEL}
+    return {'status': 'ok', 'backend': 'faster-whisper', 'model': MODEL}
 
 
 def transcribe_file(path):
@@ -37,8 +37,8 @@ def transcribe_file(path):
              path, MODEL, str(output)], capture_output=True, timeout=TIMEOUT,
         )
         if completed.returncode != 0:
-            raise RuntimeError('MLX transcription process failed; check model cache, ffmpeg and native dependencies')
-        text = json.loads(output.read_text())['text']
+            raise RuntimeError('Transcription process failed; check model cache and faster-whisper dependencies')
+        text = json.loads(output.read_text(encoding='utf-8'))['text']
         if not isinstance(text, str) or not text.strip():
             raise ValueError('No speech text was produced')
         return text.strip()
@@ -68,7 +68,7 @@ def transcribe(file: UploadFile = File(...), model: str = Form(...),
     except subprocess.TimeoutExpired:
         raise HTTPException(504, 'Transcription timed out') from None
     except (ValueError, RuntimeError):
-        raise HTTPException(503, 'Transcription failed; verify native dependencies, model cache and audio') from None
+        raise HTTPException(503, 'Transcription failed; verify faster-whisper dependencies, model cache and audio') from None
     finally:
         lock.release()
         file.file.close()

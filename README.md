@@ -2,7 +2,7 @@
 
 Group 22 · COMP41720 Distributed Systems
 
-This repository implements the Content & Metadata Service, AI Processing Service, and Synthesis Service. Content handles file storage, owner-only access, soft deletion and processing callbacks; Synthesis handles version-pinned summary jobs, citations, caching and Ollama generation. Both use PostgreSQL outboxes and RabbitMQ. AI Processing runs as an optional worker using native Mac model services; Search remains an external dependency. See [AI Processing setup](ai-processing-service/README.md) and [Synthesis setup and limits](synthesis-service/README.md).
+This repository implements the Content & Metadata Service, AI Processing Service, and Synthesis Service. Content handles file storage, owner-only access, soft deletion and processing callbacks; Synthesis handles version-pinned summary jobs, citations, caching and Ollama generation. Both use PostgreSQL outboxes and RabbitMQ. AI Processing runs as an optional worker using host model services; Search remains an external dependency. See [AI Processing setup](ai-processing-service/README.md) and [Synthesis setup and limits](synthesis-service/README.md).
 
 ## Team responsibilities
 
@@ -33,7 +33,7 @@ The table describes the team's planned service ownership and ADR topics, not fea
 | `synthesis-service/Dockerfile` | Python 3.12 container image for synthesis services |
 | `setup/setup-content-service.ps1`, `setup/setup-content-service.sh` | Create local configuration and fill missing service tokens |
 | `setup/start-content-service.ps1`, `setup/start-content-service.sh` | Run Compose in the background |
-| `ai-processing-service/` | Document processing worker, native MLX bridge, migrations and tests |
+| `ai-processing-service/` | Document processing worker, cross-platform faster-whisper bridge, migrations and tests |
 | `compose.yaml` | Content, Synthesis, PostgreSQL, RabbitMQ, and an optional AI Processing worker |
 | `.env.example` | Local configuration template |
 | `content-service/requirements.txt` | Content Python dependencies |
@@ -339,6 +339,6 @@ These steps test the Content API and publication path using manual requests in p
 
 Implemented here: containerized Content & Metadata Service and Synthesis Service, PostgreSQL databases (`studyhub` and `synthesis_db`), shared RabbitMQ 4 broker, transactional outboxes and relays, owner-only document upload/read/soft-delete, live permission/access checks, version/configuration-pinned asynchronous summaries with Ollama, verified citation identities, bounded hierarchical summarization, renewable worker claims, bounded retries, and deletion-driven cache invalidation. Development fixtures require explicit mock mode; Search is not integrated.
 
-AI Processing is also implemented as an optional Docker worker with single-document summaries, transcription through a native Mac bridge, embeddings, durable job tracking and idempotent message handling. Its proposed Search output contract still requires integration. See [AI Processing setup and limits](ai-processing-service/README.md).
+AI Processing is also implemented as an optional Docker worker with single-document summaries, transcription through a host faster-whisper bridge, embeddings, durable job tracking and idempotent message handling. Its proposed Search output contract still requires integration. See [AI Processing setup and limits](ai-processing-service/README.md).
 
 Not implemented here: Search & Index Service (vector retrieval), Gateway/login, frontend, and Prometheus/Grafana monitoring dashboard.

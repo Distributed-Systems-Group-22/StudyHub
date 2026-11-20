@@ -107,7 +107,7 @@ class ModelClient:
             logger.warning('Could not unload %s model; Ollama keep-alive will expire', task)
 
     def transcribe(self, contents, filename):
-        """Send source audio to the native bridge or a compatible transcription API."""
+        """Send source audio to the host bridge or a compatible transcription API."""
         s = self.settings
         if not s.transcription_url or not s.transcription_model:
             raise ValueError('Audio transcription URL and model are not configured')

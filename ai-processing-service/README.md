@@ -44,7 +44,7 @@ Do not overwrite existing credentials or replace Synthesis settings with Process
 | `AI_SUMMARY_MAX_TOKENS` | Summary output limit; default 512 tokens |
 
 The default models are `qwen3:4b`, `bge-m3` and
-`mlx-community/whisper-small-mlx`. Summary and embedding tasks share the provider
+`small` (multilingual Whisper through faster-whisper). Summary and embedding tasks share the provider
 setting. Transcription always sends multipart form data and expects a `text` field.
 For compatible third-party APIs, change the provider, full endpoint URLs, models and
 keys together. Synthesis uses its separate `AI_MODEL` and `OLLAMA_BASE_URL` settings.
@@ -70,9 +70,10 @@ Start Content, PostgreSQL, RabbitMQ and the required model services before the w
 
 The root Compose file includes `ai-processing-worker` behind the optional
 `processing` profile. Its image contains the Python worker and migrations;
-Ollama and MLX Whisper run natively on the Mac.
+Ollama and the faster-whisper HTTP bridge run on the host. The bridge supports
+macOS, Windows and Linux; the worker remains a separate container.
 
-From the repository root, start the native model services, then run:
+From the repository root, start the host model services, then run:
 
 ```bash
 docker compose --profile processing up --build -d ai-processing-worker
@@ -98,13 +99,14 @@ Compose injects environment variables explicitly and supplies container addresse
 Override model URLs for the container using `AI_DOCKER_SUMMARY_URL`,
 `AI_DOCKER_EMBEDDING_URL` and `AI_DOCKER_TRANSCRIPTION_URL`. Host URLs remain
 separate, so switching between host and container execution does not require editing them.
-`host.docker.internal` assumes Docker Desktop on macOS; other hosts may need networking changes.
+`host.docker.internal` is available in Docker Desktop on macOS and Windows;
+other Docker hosts may need networking changes.
 
 If a local RabbitMQ already occupies port 5672, set `RABBITMQ_HOST_PORT=5673` and
 `RABBITMQ_MANAGEMENT_PORT=15673` in `.env`. Ensure the host AMQP URL uses that port.
 Container-to-container connections continue to use `rabbitmq:5672`.
 
-## Native Mac model services
+## Host model services (macOS and Windows)
 
 Open Ollama with `qwen3:4b` and `bge-m3` downloaded. Native Ollama APIs disable
 thinking and streaming for summaries, reject output-limit truncation, and disable
@@ -113,12 +115,12 @@ in a `finally` block. A failed unload falls back to Ollama's keep-alive expiry.
 Long summaries are recursively reduced within a conservative character budget;
 this is not an exact tokenizer-based context check.
 
-Run the transcription bridge in a native Apple Silicon Python environment:
+Run the transcription bridge in a host Python environment on macOS or Windows:
 
 ```bash
 # From ai-processing-service/, reuse an existing compatible environment.
 pip install -r native/requirements.txt
-# Install ffmpeg with Homebrew if it is not already available.
+# faster-whisper decodes through PyAV; a separate system ffmpeg is not required.
 python native/transcription_server.py
 ```
 
@@ -127,7 +129,27 @@ loading the model. `POST /v1/audio/transcriptions` accepts `file` and `model` fi
 Only the configured model is allowed. Each transcription runs in a child process,
 which releases model memory on exit. Requests are serialized; a busy bridge returns
 429. Audio is limited to 5 MiB and temporary files are removed after processing.
-The model is downloaded on first use if it is not cached.
+The corresponding faster-whisper model is downloaded on first use if it is not cached.
+MLX checkpoint files cannot be reused. The default CPU INT8 settings are portable:
+
+```dotenv
+AI_TRANSCRIPTION_MODEL=small
+AI_TRANSCRIPTION_DEVICE=cpu
+AI_TRANSCRIPTION_COMPUTE_TYPE=int8
+AI_TRANSCRIPTION_CPU_THREADS=4
+AI_TRANSCRIPTION_LANGUAGE=
+```
+
+An empty language enables automatic detection; `en` or `zh` forces a language.
+For NVIDIA GPU inference, configure `AI_TRANSCRIPTION_DEVICE=cuda` and a compatible
+compute type such as `float16`, and install the CUDA/cuDNN runtime required by your
+CTranslate2 version. The CPU setup does not need CUDA. Install the provided requirements together:
+PyAV is constrained below version 19 because faster-whisper 1.2.x still uses a
+decoder argument removed in PyAV 19. Host decoder options are read
+by the bridge subprocess, not by the Docker worker. Set them in the root `.env` and
+restart the bridge after changes. Mac CPU performance may differ from the previous
+MLX GPU backend. The `native/` directory name is retained for command compatibility;
+it no longer means Apple-only.
 
 For Docker access, if loopback binding is unreachable, set
 `AI_TRANSCRIPTION_BIND=0.0.0.0` and a nonempty `AI_TRANSCRIPTION_KEY` in the root `.env`.
@@ -232,4 +254,45 @@ python -m unittest discover -s tests -v
 Tests use fake models, Content responses and an in-memory job store. They cover
 redelivery, delivery recovery, failure limits, deletion, chunk offsets, provider
 formats and pipeline behavior. Native HTTP bridge tests require its Web dependencies
-and do not load MLX. Unit tests do not establish real model, database or broker connectivity.
+and do not load model weights. Unit tests do not establish real model, database or broker connectivity.
+
+
+## Stop and uninstall the previous MLX Whisper backend
+
+Stop the old transcription server with Ctrl+C in its terminal before starting the
+replacement, since both use port 8001. If that terminal is unavailable, identify the
+listener on macOS with `lsof -nP -iTCP:8001 -sTCP:LISTEN`, verify that it is the old
+Python bridge, and send that PID a normal termination signal. Do not stop Ollama.
+
+Activate the environment where MLX Whisper was installed:
+
+```bash
+conda activate comp41720-groupAS
+python -m pip uninstall mlx-whisper
+```
+
+This removes the adapter package, not model weights or shared MLX dependencies.
+Keep `mlx` / `mlx-metal` if another project uses them. Removing them is optional
+and is not needed to switch this service to faster-whisper.
+
+To optionally remove only the old Hugging Face model cache, first preview it:
+
+```bash
+hf cache ls
+hf cache rm model/mlx-community/whisper-small-mlx --dry-run
+hf cache rm model/mlx-community/whisper-small-mlx
+```
+
+The final command asks for confirmation. Leave other repositories and the new
+faster-whisper cache intact. If your installed `hf` does not provide these commands,
+use that version's cache-management commands rather than deleting the entire cache.
+Models downloaded manually outside the Hugging Face cache need separate cleanup.
+
+Then confirm `AI_TRANSCRIPTION_MODEL=small` in the root `.env`, install
+`native/requirements.txt` if needed, and restart `native/transcription_server.py`.
+`GET http://127.0.0.1:8001/health` must report `backend: faster-whisper` and `model: small`.
+Recreate an already running Docker worker to apply the changed model setting:
+
+```bash
+docker compose --profile processing up -d ai-processing-worker
+```
