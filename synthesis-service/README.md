@@ -1,12 +1,12 @@
-﻿# StudyHub Synthesis Service
+# StudyHub Synthesis Service
 
-The Synthesis Service generates combined study summaries from one or more documents. It exposes a FastAPI API, processes jobs asynchronously through RabbitMQ, stores jobs and results in its own PostgreSQL database, and uses Ollama for text generation. Summaries include citations identifying source chunks.
+The Synthesis Service selects and combines original study excerpts from one or more documents. It exposes a FastAPI API, processes jobs asynchronously through RabbitMQ, stores jobs and results in its own PostgreSQL database, and uses Ollama for text generation. The model selects excerpt IDs; the server copies original passages and attaches their actual chunk citations. It does not publish model-authored factual prose or translations.
 
 The service uses **on-demand generation with cached results**: it reuses a matching valid result or active job before creating new work. Document permissions and versions are checked with the Content & Metadata Service rather than trusted from the cache.
 
 ## Current implementation
 
-Implemented features include asynchronous jobs, version-aware caching, concurrent request deduplication, a transactional outbox, bounded retries, worker lease recovery, hierarchical summarization, citation validation, and deletion-driven invalidation.
+Implemented features include asynchronous jobs, version-aware caching, concurrent request deduplication, a transactional outbox, bounded retries, worker lease recovery, hierarchical excerpt selection, source-bound citations, deletion-driven invalidation, and dependency/process readiness.
 
 Two integration boundaries remain incomplete:
 
@@ -54,7 +54,7 @@ All four Synthesis processes share one image and database but run separate entry
 3. A cache key identifies the user, document versions, instruction, model revision, prompt, provider identity, and generation configuration. A matching valid completed result is reused; otherwise, a matching active job is reused.
 4. For new work, the API inserts a `PENDING` job and `synthesis.requested` outbox event in one database transaction. The relay publishes after commit.
 5. The worker claims the job, rechecks its configuration and live source versions, and retrieves complete, version-pinned chunks.
-6. Sequential map/reduce splits source material into bounded prompts and combines intermediate summaries as needed. Source labels such as `[S1]` retain their identities across stages.
+6. The server splits source text into bounded original excerpts (at most 512 characters each), removing identical passages within each document. Sequential selection reduces long inputs. Structured output requires selections for every supplied document and restricts IDs to that document. The server verifies selections and renders the unchanged passages with its own `[S1]` labels.
 7. After generation, the worker rechecks configuration and access. It commits only while its claim is live and no source deletion tombstone blocks completion.
 8. The client polls job status. Before returning completed text, the API checks source permissions and versions again.
 
@@ -89,7 +89,7 @@ If Ollama is not already serving requests, start `ollama serve` in another termi
 .\setup\setup-content-service.ps1
 ```
 
-Despite its name, this existing script prepares the shared root `.env`, generates missing service tokens, and adds basic Synthesis settings. It preserves existing values. On macOS, use `bash setup/setup-content-service.sh` (requires `python3`).
+Despite its name, this existing script prepares the shared root `.env`, generates missing service tokens, and adds every missing setting from `.env.example`. It preserves existing values, including credentials. On macOS, use `bash setup/setup-content-service.sh` (requires `python3`).
 
 Review root `.env` and explicitly set:
 
@@ -122,37 +122,28 @@ The upload establishes ownership and version metadata. The next step supplies th
 
 The built-in `doc-601` and `doc-602` fixtures support offline checks. They are not Content UUIDs and cannot be used for this live API walkthrough.
 
-Create a fixture keyed by your uploaded UUID:
+The simplest first-time demo setup uploads two synthetic text files and writes matching UUID/version fixtures:
 
 ```powershell
-$documentId = 'REPLACE-WITH-YOUR-UPLOADED-DOCUMENT-UUID'
-$documentVersion = 1 # Use the version returned by Content.
-New-Item -ItemType Directory -Force -Path .\dev-fixtures | Out-Null
-@{
-    $documentId = @{
-        version = $documentVersion
-        content = 'Microservices own their data. RabbitMQ enables asynchronous communication. A transactional outbox keeps job creation and event recording atomic.'
-    }
-} | ConvertTo-Json -Depth 5 | Set-Content -Encoding UTF8 .\dev-fixtures\documents.json
+# Host Python is needed only for these setup/verification scripts.
+python -m pip install -r synthesis-service/requirements.txt
+python synthesis-service/scripts/prepare_demo.py
 ```
 
-For multiple documents, add one entry per uploaded UUID with its actual version and nonempty synthetic `content`.
+The script prints the document IDs. It refuses to overwrite an existing fixture; reuse that file's IDs for subsequent demos. Before replacing fixtures, let active jobs finish. The committed Compose configuration already mounts `synthesis-service/dev-fixtures/` read-only into both API and worker; no override file is required.
 
-Create root `compose.override.yaml` with the following content. If it already exists, merge these mounts into it instead of replacing it:
+For a manually uploaded document, create `synthesis-service/dev-fixtures/documents.json` keyed by its actual Content UUID:
 
-```yaml
-services:
-  synthesis-api:
-    volumes:
-      - ./dev-fixtures:/app/dev-fixtures:ro
-  synthesis-worker:
-    volumes:
-      - ./dev-fixtures:/app/dev-fixtures:ro
+```json
+{
+  "REPLACE-WITH-CONTENT-UUID": {
+    "version": 1,
+    "content": "Synthetic source text to summarize."
+  }
+}
 ```
 
-Compose automatically loads this override alongside `compose.yaml`. The API needs the fixture to calculate its configuration hash; the worker needs the same file for generation. Setting a host file path in `.env` alone does not mount it into a container.
-
-Keep the override and fixtures local. Changing fixture content changes its configuration hash. Do not modify fixtures during active jobs; resubmit after a source-version or configuration change.
+Use `MOCK_DOCUMENTS_FILE=/app/dev-fixtures/documents.json`. A host Windows path is not a container path. Fixtures provide text only: Content still checks actual ownership and versions. Changing fixture content changes generation/cache identity, so queued jobs using the previous fixture are rejected.
 
 ### 5. Start the complete stack
 
@@ -168,7 +159,13 @@ The API initializes its schema and migrations at startup. Compose waits for its 
 {"status":"healthy","database":"connected"}
 ```
 
-This checks the Synthesis database, not Content, RabbitMQ, Ollama, provider readiness, or inference.
+`/health` deliberately checks only the API/database, so startup does not depend on workers that have not started yet. Check `/ready` before submitting work:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8002/ready | ConvertTo-Json -Depth 4
+```
+
+`/ready` returns 200 only when the database, authenticated Content access-check API, installed Ollama model metadata, mock provider, worker consumers, outbox relay and recovery process are available; otherwise it returns 503 with boolean checks. Worker consumers are inspected through RabbitMQ. Process heartbeats run every 10 seconds and expire after 45 seconds; relay/recovery failure detection can take that long. Search mode reports not ready until its adapter/readiness is implemented. Readiness does not run inference or prove model relevance/quality.
 
 | Interface | Host address |
 | --- | --- |
@@ -231,7 +228,7 @@ Illustrative completed response (actual IDs and text will differ):
   "status": "COMPLETED",
   "attempts": 1,
   "error_message": null,
-  "summary_text": "Microservices own their data and communicate asynchronously [S1].",
+  "summary_text": "> Microservices own their data. [S1]",
   "summary_status": "VALID",
   "citations": [
     {
@@ -275,7 +272,7 @@ See root [`.env.example`](../.env.example) for shared settings. Defaults below r
 | `STUDYHUB_SYNTHESIS_TOKEN` | Empty; must be configured | Bearer token accepted by Content. |
 | `STUDYHUB_DEV_IDENTITY` | Disabled unless `1` | Enable `alice` / `bob`; also required for mock mode. |
 | `DOCUMENT_PROVIDER` | `search`; example `.env` uses `mock` | Full-document provider; Search adapter is pending. |
-| `MOCK_DOCUMENTS_FILE` | Empty | Fixture JSON path visible to API/worker; otherwise built-in fixtures are used. |
+| `MOCK_DOCUMENTS_FILE` | Application: empty; example: `/app/dev-fixtures/documents.json` | Fixture JSON path visible to API/worker; otherwise built-in fixtures are used. |
 | `SEARCH_SERVICE_URL`, `STUDYHUB_SEARCH_TOKEN` | Empty | Needed to construct the Search client; do not enable the unfinished adapter. |
 | `RETRIEVAL_VERSION` | `search-contract-pending-v1` | Retrieval identity included in generation settings/cache keys. |
 | `OLLAMA_BASE_URL` | `http://host.docker.internal:11434` | Model server reachable from Synthesis processes. |
@@ -290,9 +287,9 @@ See root [`.env.example`](../.env.example) for shared settings. Defaults below r
 
 Keep API and worker settings consistent. After changing `.env`, run `docker compose up -d` to recreate affected containers; `docker compose restart` does not apply changed environment values. Stop active workers before coordinated configuration/model upgrades and resubmit jobs with outdated snapshots.
 
-Generation also has fixed limits of 10,000 chunks and eight reduction levels. Prompt fitting uses a conservative UTF-8 byte budget rather than a model-specific tokenizer. Over-budget inputs, reductions that do not shrink, and output-limit termination fail explicitly instead of silently truncating. Calls run sequentially to limit memory pressure. A blocked read can take up to `AI_TIMEOUT_SECONDS` to unwind after cancellation/deadline detection.
+Generation also has fixed limits of 10,000 input chunks, 10,000 distinct excerpts and eight reduction levels. Final selection keeps up to eight excerpts total (or at least one per document for more than eight documents); reductions keep one excerpt per represented document. Every requested document is represented, but every chunk need not appear in the final summary. Prompt fitting uses a conservative UTF-8 byte budget rather than a model-specific tokenizer. Over-budget inputs, selections that do not shrink, invalid IDs, omitted documents and output-limit termination fail explicitly instead of silently truncating. Selection limits apply to IDs; returned quote length is bounded separately by the source/excerpt limits. Calls run sequentially to limit memory pressure. A blocked read can take up to `AI_TIMEOUT_SECONDS` to unwind after cancellation/deadline detection.
 
-Citation validation establishes source identity, not whether a source supports a statement or whether the summary is factually correct. Avoid updating/retagging a model during active jobs: pre/post digest checks cannot make the separate model server transactional.
+Published passages are copied directly from the cited source, so the model cannot invent text or attach it to another document. This establishes provenance, not truth: source material can be wrong, excerpts can lack context, and the model can choose less relevant passages. Long unpunctuated passages can be split into fragments. The service does not promise free-form explanation, translation or an answer when the sources do not contain it. Avoid updating/retagging a model during active jobs: pre/post digest checks cannot make the separate model server transactional.
 
 ## Storage and migrations
 
@@ -306,9 +303,9 @@ Synthesis owns its database and does not read Content's database directly.
 | `outbox_events` | Publication payloads, scheduled availability, and publication state. |
 | `synthesis_deleted_documents` | Deletion tombstones preventing late completion for deleted sources. |
 
-`app.database.init_db()` creates base tables and applies numbered SQL files in `migrations/` in filename order within one transaction. Current migrations are idempotent and run at API startup. Missing required migration `0004_snapshots_citations.sql` stops startup.
+`app.database.init_db()` creates base tables and applies numbered SQL files in `migrations/` in filename order within one transaction. Current migrations are idempotent and run at API startup. Missing required snapshot, heartbeat or extractive-upgrade migrations stops startup. Startup uses a database advisory lock to serialize concurrent initializers.
 
-Migration `0004` marks legacy pending/running jobs without source/configuration snapshots `FAILED` and invalidates results without those snapshots. Rows are retained; affected requests must be resubmitted. Cache schema v2 prevents reuse of older cache identities. Do not mix old workers with upgraded execution code.
+Migration `0004` marks legacy pending/running jobs without source/configuration snapshots `FAILED` and invalidates results without those snapshots. Rows are retained; affected requests must be resubmitted. Migration `0005` adds process heartbeats. Migration `0006` retains but invalidates earlier prose results and fails incompatible active jobs; resubmit those requests. Prompt version `synthesis-extractive-v3` prevents reuse of earlier prose cache identities. Do not mix old workers with upgraded execution code.
 
 The `synthesis-postgres-data` named volume persists Synthesis data. Stop the stack while retaining volumes with:
 
@@ -338,32 +335,52 @@ docker compose logs -f synthesis-api synthesis-worker synthesis-outbox-relay syn
 
 For a manual acceptance check, create a summary, poll to completion, then submit the identical request and confirm the same job returns with `cache_hit: true`. Delete its source through Content and confirm the completed text can no longer be retrieved. Depending on event timing, retrieval returns `404` from the live access check or `409` after invalidation. Check worker logs for the deletion event.
 
-For offline checks, use a local Python 3.12 virtual environment and run from the repository root:
+Unit tests live in `tests/test_*.py` and use `unittest.TestCase` / `unittest.mock`, following AI Processing's approach. They are also automatically collected by pytest. No Docker, PostgreSQL, RabbitMQ, Content or Ollama process is needed: HTTP, database and broker boundaries are mocked. Test helpers reject accidental real HTTP/database/broker connections, and each case restores environment overrides and mocks.
+
+From the repository root, install development dependencies and run pytest:
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r synthesis-service/requirements.txt
-.\.venv\Scripts\python.exe synthesis-service/scripts/smoke.py
-.\.venv\Scripts\python.exe -m compileall -q synthesis-service/app synthesis-service/scripts
+python -m pip install -r synthesis-service/requirements-dev.txt
+python -m pytest synthesis-service/tests -v
 ```
 
-The existing assert-based smoke script covers request validation, provider completeness, version/configuration changes, citation validation, cache identity, and bounded multi-document map/reduce. Content and inference are mocked; this is not an end-to-end infrastructure/model test. Real Search integration and long-document acceptance remain future integration work.
+Or use the standard-library runner with only the normal runtime dependencies installed:
+
+```powershell
+python -m unittest discover -s synthesis-service/tests -t synthesis-service -v
+```
+
+From `synthesis-service/`, the equivalent command is `python -m unittest discover -s tests -v`.
+
+The tests cover request validation and API error responses; user-scoped job retrieval and access rechecks; provider completeness and invalid metadata; original excerpts and source ownership; model versions, structured output and budgets; cache identity; job claims, leases, cancellation, retries and stale-result fencing; outbox publication, recovery and deletion acknowledgements; readiness; database initialization; and setup-script credential preservation/idempotence. Database mocks verify application decisions and transaction boundaries; actual PostgreSQL locking, SQL constraints and broker delivery remain the separate acceptance suite's responsibility.
+
+Run the real local acceptance suite separately:
+
+```powershell
+python synthesis-service/scripts/acceptance.py
+```
+
+Run it only on an idle development stack with `DOCUMENT_PROVIDER=mock`, `STUDYHUB_DEV_IDENTITY=1`, and the fixture path above. It uploads synthetic documents, replaces the local demo fixture, creates test jobs, changes/deletes only its own test documents, temporarily stops Content/RabbitMQ/worker/relay/recovery, and kills one worker to verify real lease recovery. It restores those services in `finally`. Do not run it on a shared or production stack. Synthetic rows/files remain as evidence and demo material; no existing database volumes are removed.
+
+Results, a usable demo job ID and document IDs are written to the Git-ignored local file `acceptance-results.json`. The suite uses real PostgreSQL, RabbitMQ, Content and Ollama. It checks concurrent deduplication, grounded short/long excerpts, cache, duplicate delivery, deletion invalidation, queued version/configuration changes, delayed retry, permanent errors, retry exhaustion, worker crash recovery and dependency outages. Retry classification is injected through the real job functions/DB; it is not a simulated Ollama server outage.
 
 ## Source layout
 
 | Path | Purpose |
 | --- | --- |
-| `app/main.py` | FastAPI app, startup initialization, root and database health routes. |
+| `app/main.py` | FastAPI app, startup initialization, root, `/health` and `/ready` routes. |
 | `app/database.py` | PostgreSQL connections and schema initialization. |
 | `app/schemas.py` | Request, job response, and citation schemas. |
 | `app/routes/summaries.py` | Development identity, live verification, cache/deduplication, transactional job creation. |
 | `app/routes/jobs.py` | User-scoped job lookup and authorization before returning results. |
 | `app/services/job_execution.py` | Claims/leases, snapshot checks, retries, fenced completion. |
-| `app/services/ai_client.py` | Ollama configuration/digest checks and hierarchical generation. |
+| `app/services/ai_client.py` | Ollama configuration/digest checks and bounded source-bound excerpt selection. |
 | `app/services/document_provider.py` | Complete version-pinned chunk contract, mock provider, pending Search adapter. |
 | `app/services/content_client.py` | Content access-check HTTP client. |
 | `app/services/cache.py`, `citations.py`, `errors.py`, `mock_documents.py` | Cache identity, citation checks, error categories, fixtures. |
 | `app/messaging/` | RabbitMQ consumer, outbox publisher, expired-job recovery. |
 | `migrations/` | Numbered Synthesis schema changes. |
-| `scripts/smoke.py` | Offline assert-based checks. |
+| `app/services/readiness.py` | Dependency checks and worker/relay/recovery heartbeats. |
+| `tests/test_*.py`, `requirements-dev.txt`, `pytest.ini` | Offline unittest suite, pytest collection and test dependencies. |
+| `scripts/prepare_demo.py`, `scripts/acceptance.py` | Synthetic fixture setup and real local acceptance tests. |
 | `Dockerfile`, `requirements.txt` | Shared image and runtime dependencies. |

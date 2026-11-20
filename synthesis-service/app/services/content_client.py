@@ -96,4 +96,14 @@ def verify_document_access(
             "Content Service returned invalid document data"
         )
 
+    seen = set()
+    for document in documents:
+        if (not isinstance(document, dict)
+                or not isinstance(document.get("documentId"), str)
+                or document["documentId"] not in document_ids
+                or document["documentId"] in seen
+                or type(document.get("documentVersion")) is not int
+                or document["documentVersion"] < 1):
+            raise ContentServiceUnavailable("Content Service returned invalid document metadata")
+        seen.add(document["documentId"])
     return documents

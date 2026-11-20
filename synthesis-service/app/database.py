@@ -15,10 +15,14 @@ def get_connection():
 
 def init_db():
     migrations_dir = Path(__file__).resolve().parent.parent / "migrations"
-    if not (migrations_dir / "0004_snapshots_citations.sql").is_file():
+    if not all((migrations_dir / name).is_file() for name in (
+        "0004_snapshots_citations.sql", "0005_service_heartbeats.sql", "0006_extractive_results.sql"
+    )):
         raise RuntimeError("Synthesis migrations are missing; refusing an incomplete schema")
     with get_connection() as conn:
         with conn.cursor() as cur:
+
+            cur.execute("SELECT pg_advisory_xact_lock(4172022)")
 
             # 1. Background jobs
             cur.execute("""

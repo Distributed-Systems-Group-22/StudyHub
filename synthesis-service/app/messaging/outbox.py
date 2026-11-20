@@ -88,7 +88,7 @@ def publish_one(channel):
     return True
 
 
-def main():
+def run_loop():
     while True:
         connection = None
 
@@ -133,6 +133,13 @@ def main():
         finally:
             if connection is not None and connection.is_open:
                 connection.close()
+
+
+def main():
+    from app.services.readiness import service_heartbeat
+
+    with service_heartbeat("outbox-relay"):
+        run_loop()
 
 
 if __name__ == "__main__":
