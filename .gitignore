@@ -8,3 +8,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 uploads/
+synthesis-service/dev-fixtures/*.json
+synthesis-service/acceptance-results.json
+synthesis-service/COMPLETION_REPORT.md

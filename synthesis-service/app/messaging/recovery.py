@@ -107,7 +107,7 @@ def recover_expired_jobs():
     return recovered
 
 
-def main():
+def run_loop():
     print("Recovery Service started", flush=True)
 
     while True:
@@ -121,6 +121,13 @@ def main():
             )
 
         time.sleep(POLL_INTERVAL)
+
+
+def main():
+    from app.services.readiness import service_heartbeat
+
+    with service_heartbeat("recovery"):
+        run_loop()
 
 
 if __name__ == "__main__":

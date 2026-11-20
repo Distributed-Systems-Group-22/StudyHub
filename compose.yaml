@@ -172,6 +172,7 @@ services:
     volumes:
       - ./synthesis-service/app:/app/app
       - ./synthesis-service/migrations:/app/migrations:ro
+      - ./synthesis-service/dev-fixtures:/app/dev-fixtures:ro
     depends_on:
       synthesis-db:
         condition: service_healthy
@@ -189,6 +190,7 @@ services:
     command: ["python", "-m", "app.messaging.consumer"]
     volumes:
       - ./synthesis-service/app:/app/app
+      - ./synthesis-service/dev-fixtures:/app/dev-fixtures:ro
     depends_on:
       synthesis-api:
         condition: service_healthy

@@ -1,9 +1,11 @@
-﻿"""Small offline self-check: python synthesis-service/scripts/smoke.py (no services required)."""
+"""Small offline self-check: python synthesis-service/scripts/smoke.py (no services required)."""
 import json
 import os
 from pathlib import Path
 import sys
 import tempfile
+import subprocess
+import shutil
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -21,7 +23,7 @@ from app.services.citations import source_catalog, validate_citations
 from app.services.document_provider import Chunk, DocumentBundle, get_document_chunks, validate_bundle
 from app.services.errors import (
     BudgetExceeded, GenerationConfigChanged, InvalidCitation, InvalidSourceData,
-    ProviderNotConfigured, SourceVersionExpired,
+    ProviderNotConfigured, ProviderUnavailable, SourceVersionExpired,
 )
 
 
@@ -34,9 +36,48 @@ def rejects(error_type, function, *args, **kwargs):
 
 
 def main():
+    root = Path(__file__).resolve().parents[2]
+    with tempfile.TemporaryDirectory(prefix="synthesis-setup-check-") as scratch:
+        folder = Path(scratch)
+        (folder / "setup").mkdir()
+        shutil.copy(root / ".env.example", folder / ".env.example")
+        setup = root / "setup" / "setup-content-service.ps1"
+        shutil.copy(setup, folder / "setup" / setup.name)
+        shell_python = (root / "setup" / "setup-content-service.sh").read_text(encoding="utf-8").split("<<'PYTHON'\n", 1)[1].split("\nPYTHON", 1)[0]
+        commands = [[sys.executable, "-c", shell_python]]
+        if os.name == "nt":
+            commands.append(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(folder / "setup" / setup.name)])
+        for command in commands:
+            local = folder / ".env"
+            local.write_text("POSTGRES_PASSWORD=keep_existing\nSTUDYHUB_PROCESSING_TOKEN=keep_token\nSTUDYHUB_SEARCH_TOKEN=\n", encoding="utf-8")
+            subprocess.run(command, cwd=folder, check=True, capture_output=True)
+            first = local.read_text(encoding="utf-8")
+            assert "POSTGRES_PASSWORD=keep_existing" in first and "STUDYHUB_PROCESSING_TOKEN=keep_token" in first
+            assert "DOCUMENT_PROVIDER=mock" in first and "AI_SUMMARY_MODEL=qwen3:4b" in first
+            assert "STUDYHUB_SEARCH_TOKEN=\n" not in first
+            subprocess.run(command, cwd=folder, check=True, capture_output=True)
+            assert local.read_text(encoding="utf-8") == first
     environment = {"STUDYHUB_DEV_IDENTITY": "1", "DOCUMENT_PROVIDER": "mock",
                    "AI_CONTEXT_SIZE": "2048", "AI_OUTPUT_TOKENS": "96", "AI_MAX_CALLS": "64"}
     with patch.dict(os.environ, environment), patch.object(ai, "resolve_model_revision", return_value="digest-v1"):
+        from app.services import readiness
+        from unittest.mock import MagicMock
+        with patch("app.main.readiness_checks", return_value={"worker": False}):
+            assert TestClient(app).get("/ready").status_code == 503
+        with patch("app.main.readiness_checks", return_value={"worker": True}):
+            assert TestClient(app).get("/ready").status_code == 200
+        connection = MagicMock()
+        connection.__enter__.return_value.execute.return_value.fetchall.return_value = [(s,) for s in readiness.SERVICES]
+        broker = MagicMock()
+        broker.__enter__.return_value.channel.return_value.queue_declare.return_value.method.consumer_count = 1
+        with patch.object(readiness, "resolve_model_revision", return_value="digest-v1"), \
+                patch.object(readiness, "get_connection", return_value=connection), \
+                patch.object(readiness.pika, "BlockingConnection", return_value=broker), \
+                patch.object(readiness.httpx, "post", return_value=httpx.Response(200, json={"documents": []}, request=httpx.Request("POST", "http://content/internal/documents/access-check"))), \
+                patch.dict(os.environ, {"RABBITMQ_USER": "test", "RABBITMQ_PASSWORD": "test", "STUDYHUB_SYNTHESIS_TOKEN": "test"}):
+            assert all(readiness.readiness_checks().values())
+            broker.__enter__.return_value.channel.return_value.queue_declare.return_value.method.consumer_count = 0
+            assert readiness.readiness_checks()["worker"] is False
         schema = app.openapi()
         assert "citations" in schema["components"]["schemas"]["JobStatusResponse"]["properties"]
         request = SummaryRequest(document_ids=[" doc-601 "], instruction=" Summarise ")
@@ -93,37 +134,80 @@ def main():
         def ollama_response(request):
             payload = json.loads(request.content)
             assert payload["options"] == config["options"] and payload["stream"] is False
+            choice = payload["format"]["properties"]["selected_ids"]
+            assert choice["required"] == ["D1"]
+            assert choice["properties"]["D1"]["items"]["enum"] == ["E1"]
             return httpx.Response(200, json={"model": config["model"], "done": True,
-                                           "response": "Overview [S1]", "eval_count": 8,
+                                           "response": json.dumps({"selected_ids": {"D1": ["E1"]}}), "eval_count": 8,
                                            "prompt_eval_count": 100})
 
         with httpx.Client(transport=httpx.MockTransport(ollama_response)) as client, \
                 patch.object(ai.httpx, "stream", side_effect=client.stream):
-            assert ai._generate("Small prompt", config, lambda: None) == "Overview [S1]"
+            assert ai._generate("Small prompt", config, lambda: None, {"D1": ["E1"]}, 1) == json.dumps({"selected_ids": {"D1": ["E1"]}})
+
+        # Remote inference failures must not become successful or truncated summaries.
+        base = {"model": config["model"], "done": True, "response": "{}", "eval_count": 8, "prompt_eval_count": 100}
+        for changes, expected in [({"done": False}, ProviderUnavailable),
+                                  ({"response": ""}, ProviderUnavailable),
+                                  ({"done_reason": "length"}, BudgetExceeded),
+                                  ({"eval_count": config["options"]["num_predict"]}, BudgetExceeded),
+                                  ({"model": "unexpected"}, GenerationConfigChanged),
+                                  ({"prompt_eval_count": config["options"]["num_ctx"]}, BudgetExceeded)]:
+            with httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(200, json={**base, **changes}))) as client, \
+                    patch.object(ai.httpx, "stream", side_effect=client.stream):
+                rejects(expected, ai._generate, "Small prompt", config, lambda: None, {"D1": ["E1"]}, 1)
+        from app.services import content_client
+        with patch.object(content_client, "SYNTHESIS_TOKEN", "test"):
+            for payload in ({"documents": [None]}, {"documents": [{"documentId": "a", "documentVersion": True}]},
+                            {"documents": [{"documentId": "other", "documentVersion": 1}]},
+                            {"documents": [{"documentId": "a", "documentVersion": 1}] * 2}):
+                client = httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=payload)))
+                with patch.object(content_client.httpx, "Client", return_value=client):
+                    rejects(content_client.ContentServiceUnavailable, content_client.verify_document_access, "alice", ["a"])
 
         # Simulated inference checks batching/coverage without calling Ollama.
-        seen = {"S1": "", "S2": ""}
-        calls = []
+        seen, calls = {}, []
 
-        def inference(prompt, config, checkpoint):
+        def inference(prompt, config, checkpoint, selection_ids, selection_limit):
             checkpoint()
             assert ai.prompt_fits(prompt, config)
             records, _ = json.JSONDecoder().raw_decode(prompt.split("Source material (JSON):\n", 1)[1])
             calls.append(records)
-            labels = list(dict.fromkeys(label for r in records for label in r["source_ids"]))
+            selected = {}
             for record in records:
-                if set(record["text"]) in ({"A"}, {"B"}):
-                    seen[record["source_ids"][0]] += record["text"]
-            return "Overview " + " ".join(f"[{label}]" for label in labels)
+                seen[record["id"]] = record
+                selected.setdefault(record["document_id"], [record["id"]])
+            return json.dumps({"selected_ids": selected})
 
-        long_chunks = [Chunk("doc-601", 1, "a", "A" * 4500), Chunk("doc-602", 1, "b", "B" * 4500)]
+        long_chunks = [Chunk("doc-601", 1, "a", " ".join("A" * 100 + str(i) + "." for i in range(45))),
+                       Chunk("doc-602", 1, "b", " ".join("B" * 100 + str(i) + "." for i in range(45)))]
         with patch.object(ai, "_generate", side_effect=inference):
             result = ai.generate_summary(long_chunks, "Summarise", config)
             assert len(calls) > 1 and len(result["citations"]) == 2
-            assert seen == {"S1": "A" * 4500, "S2": "B" * 4500}
+            for index, chunk in enumerate(long_chunks, 1):
+                observed = "".join(r["text"] for r in seen.values() if r["document_id"] == f"D{index}")
+                assert observed == chunk.text.replace(" ", "")
             rejects(BudgetExceeded, ai.generate_summary, long_chunks, "Summarise", {**config, "max_calls": 1})
-        with patch.object(ai, "_generate", return_value="Fake source [S999]"):
+        with patch.object(ai, "_generate", side_effect=inference):
+            unpunctuated = ai.generate_summary([Chunk("one", 1, "c", "A" * 9000)], "Summarise", config)
+            assert unpunctuated["calls"] > 1 and len(unpunctuated["citations"]) == 1
+        with patch.object(ai, "_generate", return_value='{"selected_ids": ["E99999"]}'):
             rejects(InvalidCitation, ai.generate_summary, chunks, "Summarise", config)
+        records = [{"id": "E1", "document_id": "a", "source_id": "S1", "text": "Original [1]."},
+                   {"id": "E2", "document_id": "b", "source_id": "S2", "text": "Second fact."}]
+        for invalid in ({"selected_ids": {"a": ["E1"]}},
+                        {"selected_ids": {"a": ["E1", "E1"], "b": ["E2"]}},
+                        {"selected_ids": {"a": ["E2"], "b": ["E1"]}},
+                        {"selected_ids": {"a": ["fake"], "b": ["E2"]}},
+                        {"selected_ids": [None]}, []):
+            rejects(InvalidCitation, ai.select_excerpts, json.dumps(invalid), records)
+        selected = ai.select_excerpts('{"selected_ids":{"b":["E2"],"a":["E1"]}}', records)
+        assert selected == [records[1], records[0]]
+        quote_chunks = [Chunk("a", 1, "a1", "Original [1]."), Chunk("b", 1, "b1", "Second fact.")]
+        with patch.object(ai, "_generate", return_value='{"selected_ids":{"D2":["E2"],"D1":["E1"]}}'):
+            quoted = ai.generate_summary(quote_chunks, "Summarise", config)
+            assert quoted["summary_text"] == "> Second fact. [S2]\n\n> Original [1]. [S1]"
+            assert [c["document_id"] for c in quoted["citations"]] == ["b", "a"]
 
         with patch.object(jobs, "claim_job", return_value=job), \
                 patch.object(jobs, "verify_source_snapshot", return_value={"doc-601": 2, "doc-602": 1}), \
@@ -141,7 +225,7 @@ def main():
             jobs.process_job("offline")
             assert isinstance(fail.call_args.args[1], SourceVersionExpired)
             save.assert_not_called()
-    print("PASS: schemas/HTTP 422, OpenAPI, provider coverage/fail-closed, citations, cache/config snapshots,")
+    print("PASS: schemas/HTTP 422, OpenAPI, provider coverage/fail-closed, grounded excerpts, readiness, cache/config snapshots,")
     print("      bounded multi-document map/reduce, queued and post-generation version changes")
 
 

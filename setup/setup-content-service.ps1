@@ -23,18 +23,12 @@ try {
         }
     }
 
-    foreach ($pair in @(
-        @{ Key = 'SYNTHESIS_DB'; Val = 'synthesis_db' },
-        @{ Key = 'SYNTHESIS_DB_USER'; Val = 'synthesis' },
-        @{ Key = 'SYNTHESIS_DB_PASSWORD'; Val = 'synthesis_dev' },
-        @{ Key = 'OLLAMA_BASE_URL'; Val = 'http://host.docker.internal:11434' },
-        @{ Key = 'AI_MODEL'; Val = 'llama3.2:1b' }
-    )) {
-        $k = $pair.Key
-        $v = $pair.Val
-        $assignment = "(?m)^[ \t]*${k}[ \t]*="
-        if ($envText -notmatch $assignment) {
-            $envText = $envText.TrimEnd() + "`r`n$k=$v`r`n"
+    foreach ($line in Get-Content -LiteralPath '.env.example') {
+        if ($line -match '^([A-Z][A-Z0-9_]*)=') {
+            $key = $Matches[1]
+            if ($envText -notmatch "(?m)^[ \t]*${key}[ \t]*=") {
+                $envText = $envText.TrimEnd() + "`r`n$line`r`n"
+            }
         }
     }
     if ($envText -ne $originalEnvText) {

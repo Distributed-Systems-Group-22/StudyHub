@@ -147,6 +147,7 @@ def fail_job(job, error):
     """Permanent errors fail immediately; transient errors keep bounded backoff."""
     permanent = (isinstance(error, PermissionError)
                  or isinstance(error, SynthesisError) and not error.retryable)
+    message = str(error)[:500] if isinstance(error, (SynthesisError, PermissionError)) else f"infrastructure_error: {type(error).__name__}"
     with get_connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("""
@@ -163,13 +164,13 @@ def fail_job(job, error):
                     UPDATE synthesis_jobs SET status = 'FAILED', claim_token = NULL,
                         lease_until = NULL, error_message = %s, updated_at = NOW()
                     WHERE job_id = %s
-                """, (str(error)[:500], job["job_id"]))
+                """, (message, job["job_id"]))
                 return
             retry_at = datetime.now(timezone.utc) + timedelta(seconds=2 ** current["attempts"])
             cur.execute("""
                 UPDATE synthesis_jobs SET status = 'PENDING', claim_token = NULL, lease_until = NULL,
                     next_attempt_at = %s, error_message = %s, updated_at = NOW() WHERE job_id = %s
-            """, (retry_at, str(error)[:500], job["job_id"]))
+            """, (retry_at, message, job["job_id"]))
             event_id = uuid4()
             payload = {"event_id": str(event_id), "event_type": "synthesis.requested", "job_id": str(job["job_id"])}
             cur.execute("""
@@ -236,5 +237,5 @@ def process_job(job_id, cancelled=None):
         # Stop renewing; Recovery will retry if this worker lost its delivery/lease.
         print(f"Job {job_id}: {error}", flush=True)
     except Exception as error:
-        print(f"Job {job_id} failed: {error}", flush=True)
+        print(f"Job {job_id} failed: {type(error).__name__}", flush=True)
         fail_job(job, error)
