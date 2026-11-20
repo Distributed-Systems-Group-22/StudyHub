@@ -1,4 +1,4 @@
-"""Optional bridge tests: install native Web dependencies, MLX not needed."""
+"""Optional bridge tests: install native Web dependencies, model weights not needed."""
 import importlib.util
 from pathlib import Path
 import subprocess
@@ -42,7 +42,7 @@ class NativeTests(unittest.TestCase):
         self.assertFalse(self.server.lock.locked())
 
     def test_timeout_releases_lock(self):
-        with patch.object(self.server, 'transcribe_file', side_effect=subprocess.TimeoutExpired('mlx', 1)):
+        with patch.object(self.server, 'transcribe_file', side_effect=subprocess.TimeoutExpired('faster-whisper', 1)):
             response = self.request(headers={'Authorization': 'Bearer test-token'})
         self.assertEqual(response.status_code, 504)
         self.assertFalse(self.server.lock.locked())

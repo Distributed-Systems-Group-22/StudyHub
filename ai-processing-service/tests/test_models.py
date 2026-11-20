@@ -12,7 +12,7 @@ class ModelTests(unittest.TestCase):
             summary_model='qwen3:4b', summary_key='', embedding_url='http://localhost/api/embed',
             embedding_model='bge-m3', embedding_key='', ollama_context=4096, summary_max_tokens=512,
             transcription_url='http://localhost:8001/v1/audio/transcriptions',
-            transcription_model='mlx-community/whisper-small-mlx', transcription_key='')
+            transcription_model='small', transcription_key='')
         self.client = ModelClient(self.settings)
         self.client._post = Mock()
 
