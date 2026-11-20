@@ -335,16 +335,24 @@ docker compose logs -f synthesis-api synthesis-worker synthesis-outbox-relay syn
 
 For a manual acceptance check, create a summary, poll to completion, then submit the identical request and confirm the same job returns with `cache_hit: true`. Delete its source through Content and confirm the completed text can no longer be retrieved. Depending on event timing, retrieval returns `404` from the live access check or `409` after invalidation. Check worker logs for the deletion event.
 
-For offline checks, use a local Python 3.12 virtual environment and run from the repository root:
+Unit tests live in `tests/test_*.py` and use `unittest.TestCase` / `unittest.mock`, following AI Processing's approach. They are also automatically collected by pytest. No Docker, PostgreSQL, RabbitMQ, Content or Ollama process is needed: HTTP, database and broker boundaries are mocked. Test helpers reject accidental real HTTP/database/broker connections, and each case restores environment overrides and mocks.
+
+From the repository root, install development dependencies and run pytest:
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r synthesis-service/requirements.txt
-.\.venv\Scripts\python.exe synthesis-service/scripts/smoke.py
-.\.venv\Scripts\python.exe -m compileall -q synthesis-service/app synthesis-service/scripts
+python -m pip install -r synthesis-service/requirements-dev.txt
+python -m pytest synthesis-service/tests -v
 ```
 
-The assert-based smoke script checks configuration setup (preserving existing secrets and idempotence), request validation, provider coverage, invalid Content responses, readiness, source-bound selections, model failure/output limits, cache identity, long-input coverage and version/configuration changes. Its HTTP/model/database paths are mocked.
+Or use the standard-library runner with only the normal runtime dependencies installed:
+
+```powershell
+python -m unittest discover -s synthesis-service/tests -t synthesis-service -v
+```
+
+From `synthesis-service/`, the equivalent command is `python -m unittest discover -s tests -v`.
+
+The tests cover request validation and API error responses; user-scoped job retrieval and access rechecks; provider completeness and invalid metadata; original excerpts and source ownership; model versions, structured output and budgets; cache identity; job claims, leases, cancellation, retries and stale-result fencing; outbox publication, recovery and deletion acknowledgements; readiness; database initialization; and setup-script credential preservation/idempotence. Database mocks verify application decisions and transaction boundaries; actual PostgreSQL locking, SQL constraints and broker delivery remain the separate acceptance suite's responsibility.
 
 Run the real local acceptance suite separately:
 
@@ -373,6 +381,6 @@ Results, a usable demo job ID and document IDs are written to the Git-ignored lo
 | `app/messaging/` | RabbitMQ consumer, outbox publisher, expired-job recovery. |
 | `migrations/` | Numbered Synthesis schema changes. |
 | `app/services/readiness.py` | Dependency checks and worker/relay/recovery heartbeats. |
-| `scripts/smoke.py` | Offline assert-based checks. |
+| `tests/test_*.py`, `requirements-dev.txt`, `pytest.ini` | Offline unittest suite, pytest collection and test dependencies. |
 | `scripts/prepare_demo.py`, `scripts/acceptance.py` | Synthetic fixture setup and real local acceptance tests. |
 | `Dockerfile`, `requirements.txt` | Shared image and runtime dependencies. |
